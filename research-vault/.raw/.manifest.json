@@ -1,0 +1,53 @@
+{
+  "sources": {
+    ".raw/articles/transformer-multi-source-da-emnlp-2020-2026-04-27.md": {
+      "hash": "url-fetch",
+      "ingested_at": "2026-04-27",
+      "pages_created": ["wiki/sources/Transformer Multi-Source DA (Wright EMNLP2020).md", "wiki/concepts/Multi-Source DA for NLP.md"],
+      "pages_updated": ["wiki/index.md", "wiki/concepts/DANN for NLP Text Domain Adaptation.md"]
+    },
+    ".raw/articles/udalm-naacl-2021-2026-04-27.md": {
+      "hash": "url-fetch",
+      "ingested_at": "2026-04-27",
+      "pages_created": ["wiki/sources/UDALM UDA through Language Modeling (Karouzos NAACL2021).md"],
+      "pages_updated": ["wiki/index.md", "wiki/concepts/Domain-Adaptive Pre-Training (DAPT).md", "wiki/concepts/DANN for NLP Text Domain Adaptation.md"]
+    },
+    ".raw/articles/pseudo-label-uda-adaptnlp-2021-2026-04-27.md": {
+      "hash": "url-fetch",
+      "ingested_at": "2026-04-27",
+      "pages_created": ["wiki/sources/Pseudo-Label Guided UDA (Chen AdaptNLP2021).md"],
+      "pages_updated": ["wiki/index.md", "wiki/concepts/Self-Training for NLP DA.md"]
+    },
+    ".raw/articles/simplified-neural-uda-naacl-2019-2026-04-27.md": {
+      "hash": "url-fetch",
+      "ingested_at": "2026-04-27",
+      "pages_created": ["wiki/sources/Simplified Neural UDA (Miller NAACL2019).md"],
+      "pages_updated": ["wiki/index.md", "wiki/concepts/Pivot-Based Methods for NLP DA.md"]
+    },
+    ".raw/articles/residual-transfer-networks-nips-2016-2026-04-27.md": {
+      "hash": "url-fetch",
+      "ingested_at": "2026-04-27",
+      "pages_created": ["wiki/sources/Residual Transfer Networks (Long NeurIPS2016).md"],
+      "pages_updated": ["wiki/index.md", "wiki/concepts/Discrepancy Minimization for NLP DA.md"]
+    },
+    ".raw/articles/knowledge-distillation-bert-uda-arxiv-2020-2026-04-27.md": {
+      "hash": "url-fetch",
+      "ingested_at": "2026-04-27",
+      "pages_created": ["wiki/sources/Knowledge Distillation for BERT UDA (Ryu arXiv2020).md"],
+      "pages_updated": ["wiki/index.md", "wiki/concepts/ADDA.md"]
+    },
+    ".raw/articles/self-adaptation-uda-ranlp-2019-2026-04-27.md": {
+      "hash": "url-fetch",
+      "ingested_at": "2026-04-27",
+      "pages_created": ["wiki/sources/Self-Adaptation UDA (Cui RANLP2019).md"],
+      "pages_updated": ["wiki/index.md", "wiki/concepts/Self-Training for NLP DA.md"]
+    },
+    ".raw/articles/uda-contextualized-embeddings-seq-labeling-emnlp-2019-2026-04-27.md": {
+      "hash": "url-fetch",
+      "ingested_at": "2026-04-27",
+      "pages_created": ["wiki/sources/UDA Contextualized Embeddings Seq Labeling (Han EMNLP2019).md"],
+      "pages_updated": ["wiki/index.md", "wiki/concepts/Domain-Adaptive Pre-Training (DAPT).md"]
+    }
+  },
+  "address_map": {}
+}

@@ -34,7 +34,7 @@ def main():
     print("Loading target data...")
     print("="*60)
     
-    df = pd.read_csv('./datasets/coastsent_train.csv')
+    df = pd.read_csv('./datasets/lazada_train.csv')
     
     print(f"Dataset shape: {df.shape}")
     print(f"\nColumns: {df.columns.tolist()}")
@@ -42,7 +42,7 @@ def main():
     print(df.head())
     
     # Extract text data (use 'content' column based on preprocessing notebook)
-    texts = df['text'].dropna().tolist()
+    texts = df['reviewContent'].dropna().tolist()
     
     print(f"\nTotal texts for MLM training: {len(texts)}")
     print(f"\nSample text:")

@@ -125,13 +125,13 @@ def main():
     print("="*60)
     
     # Load .csv
-    df = pd.read_csv('./datasets/lazada_train.csv')
+    df = pd.read_csv('./datasets/coastsent_train.csv')
     
     # Load target domain test .csv
-    target_test_df = pd.read_csv('./datasets/coastsent_test.csv')
+    target_test_df = pd.read_csv('./datasets/lazada_test.csv')
     
     # Load source domain test .csv
-    source_test_df = pd.read_csv('./datasets/lazada_test.csv')
+    source_test_df = pd.read_csv('./datasets/coastsent_test.csv')
     
     print(f"Dataset shape: {df.shape}")
     print(f"\nColumns: {df.columns.tolist()}")
