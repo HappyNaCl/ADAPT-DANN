@@ -128,8 +128,8 @@ def main():
     df = pd.read_csv('./datasets/coastsent_train.csv')
     
     # Load target domain test .csv
-    target_test_df = pd.read_csv('./datasets/lazada_test.csv')
-    
+    target_test_df = pd.read_csv('./datasets/lazada_test_preprocessed.csv')
+
     # Load source domain test .csv
     source_test_df = pd.read_csv('./datasets/coastsent_test.csv')
     
@@ -190,7 +190,7 @@ def main():
     
     # Create dataset from DataFrame
     dataset_dict = {
-        "text": df['reviewContent'].tolist(),
+        "text": df['text'].tolist(),
         "label": df['label_id'].tolist()
     }
     
@@ -245,8 +245,8 @@ def main():
     training_args = TrainingArguments(
         output_dir="./models/indobert_source_finetuned",
         num_train_epochs=3,
-        per_device_train_batch_size=16,
-        per_device_eval_batch_size=16,
+        per_device_train_batch_size=32,
+        per_device_eval_batch_size=32,
         learning_rate=2e-5,
         weight_decay=0.01,
         warmup_steps=500,
@@ -362,7 +362,7 @@ def main():
         trainer=trainer,
         tokenizer=tokenizer,
         test_df=source_test_df,
-        text_column='reviewContent',
+        text_column='text',
         label2id=label2id,
         id2label=id2label,
         domain_name='source',

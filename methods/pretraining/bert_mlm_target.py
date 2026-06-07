@@ -34,7 +34,7 @@ def main():
     print("Loading target data...")
     print("="*60)
     
-    df = pd.read_csv('./datasets/lazada_train.csv')
+    df = pd.read_csv('./datasets/lazada_train_preprocessed.csv')
     
     print(f"Dataset shape: {df.shape}")
     print(f"\nColumns: {df.columns.tolist()}")
@@ -42,7 +42,7 @@ def main():
     print(df.head())
     
     # Extract text data (use 'content' column based on preprocessing notebook)
-    texts = df['reviewContent'].dropna().tolist()
+    texts = df['text'].dropna().tolist()
     
     print(f"\nTotal texts for MLM training: {len(texts)}")
     print(f"\nSample text:")
@@ -132,8 +132,8 @@ def main():
     training_args = TrainingArguments(
         output_dir="./models/indobert_mlm_target",
         num_train_epochs=3,
-        per_device_train_batch_size=8,
-        per_device_eval_batch_size=8,
+        per_device_train_batch_size=32,
+        per_device_eval_batch_size=32,
         save_steps=500,
         save_total_limit=2,
         eval_strategy="steps",
