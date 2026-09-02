@@ -34,7 +34,7 @@ def main():
     print("Loading target data...")
     print("="*60)
     
-    df = pd.read_csv('./datasets/lazada_train_preprocessed.csv')
+    df = pd.read_csv('../../datasets/lazada_train_preprocessed.csv')
     
     print(f"Dataset shape: {df.shape}")
     print(f"\nColumns: {df.columns.tolist()}")
@@ -86,7 +86,7 @@ def main():
         return tokenizer(
             examples["text"],
             truncation=True,
-            max_length=512,
+            max_length=128,
             padding="max_length",
             return_special_tokens_mask=True
         )
@@ -139,8 +139,8 @@ def main():
         eval_strategy="steps",
         eval_steps=500,
         logging_steps=100,
-        learning_rate=5e-5,
-        weight_decay=0.01,
+        learning_rate=1e-5,
+        weight_decay=0.02,
         warmup_steps=500,
         fp16=torch.cuda.is_available(),  # Use mixed precision if GPU available
         logging_dir="./logs",

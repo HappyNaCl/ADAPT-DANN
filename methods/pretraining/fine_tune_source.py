@@ -1,8 +1,15 @@
 """
-Fine-tune Domain-Adapted IndoBERT on Source Dataset
+Fine-tune DAPT Model on Target Dataset
 
-This script fine-tunes the domain-adapted IndoBERT (from MLM training) for sentiment 
-classification using source_balanced.csv
+This script loads the DAPT (Domain Adaptive Pretrained) model from
+indobert_mlm_target_final and fine-tunes it for sentiment classification
+on TARGET domain (Lazada) data, then evaluates on both source and target
+test sets.
+
+Pipeline:
+  1. bert_mlm_target.py  → MLM pretraining on target → DAPT model
+  2. This script          → Fine-tune DAPT on target labeled data
+  3. Evaluate on source + target test sets
 """
 
 import os
@@ -118,20 +125,20 @@ def main():
     print(f"Using device: {device}")
     
     # ========================================================================
-    # Load Source Dataset
+    # Load Target Dataset (for fine-tuning)
     # ========================================================================
     print("\n" + "="*60)
-    print("Loading source dataset...")
+    print("Loading target dataset for fine-tuning...")
     print("="*60)
     
-    # Load .csv
-    df = pd.read_csv('./datasets/coastsent_train.csv')
+    # Load target training data
+    df = pd.read_csv('../../datasets/lazada_train_preprocessed.csv')
     
     # Load target domain test .csv
-    target_test_df = pd.read_csv('./datasets/lazada_test_preprocessed.csv')
-
+    target_test_df = pd.read_csv('../../datasets/lazada_test_preprocessed.csv')
+    
     # Load source domain test .csv
-    source_test_df = pd.read_csv('./datasets/coastsent_test.csv')
+    source_test_df = pd.read_csv('../../datasets/telemedicine_preprocessed/test.csv')
     
     print(f"Dataset shape: {df.shape}")
     print(f"\nColumns: {df.columns.tolist()}")
@@ -143,6 +150,11 @@ def main():
     # Create label mapping
     label2id = {'negative': 0, 'positive': 1}
     id2label = {0: 'negative', 1: 'positive'}
+    
+    # Normalize labels to lowercase
+    df['label'] = df['label'].astype(str).str.strip().str.lower()
+    target_test_df['label'] = target_test_df['label'].astype(str).str.strip().str.lower()
+    source_test_df['label'] = source_test_df['label'].astype(str).str.strip().str.lower()
     
     # Convert labels to numeric
     df['label_id'] = df['label'].map(label2id)
@@ -177,6 +189,9 @@ def main():
         ignore_mismatched_sizes=True  # Ignore the MLM head, use classification head instead
     )
     
+    # Fix: ensure problem_type is set correctly for CrossEntropyLoss
+    model.config.problem_type = "single_label_classification"
+    
     print(f"Model loaded successfully!")
     print(f"Model type: {model.__class__.__name__}")
     print(f"Number of labels: {model.config.num_labels}")
@@ -206,7 +221,7 @@ def main():
         return tokenizer(
             examples["text"],
             truncation=True,
-            max_length=512,
+            max_length=128,
             padding=False  # Dynamic padding will be handled by data collator
         )
     
@@ -243,13 +258,13 @@ def main():
     
     # Define training arguments
     training_args = TrainingArguments(
-        output_dir="./models/indobert_source_finetuned",
+        output_dir="./models/indobert_dapt_target_finetuned",
         num_train_epochs=3,
         per_device_train_batch_size=32,
         per_device_eval_batch_size=32,
-        learning_rate=2e-5,
-        weight_decay=0.01,
-        warmup_steps=500,
+        learning_rate=1e-5,
+        weight_decay=0.02,
+        warmup_ratio=0.1,
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
@@ -331,7 +346,7 @@ def main():
     print("Saving the fine-tuned model...")
     print("="*60)
     
-    output_dir = "./models/indobert_source_final"
+    output_dir = "./models/indobert_dapt_target_final"
     
     print(f"Saving model to {output_dir}...")
     trainer.save_model(output_dir)
@@ -389,8 +404,9 @@ def main():
     # Final Summary
     # ========================================================================
     print("\n" + "="*60)
-    print("FINAL SUMMARY - Source vs Target Performance")
+    print("FINAL SUMMARY - DAPT Fine-tuned on Target")
     print("="*60)
+    print(f"\nPipeline: MLM on target → Fine-tune on target → Evaluate")
     print(f"\n{'Metric':<12} {'Source':<15} {'Target':<15} {'Gap':<10}")
     print("-"*52)
     for metric in ['accuracy', 'precision', 'recall', 'f1']:
