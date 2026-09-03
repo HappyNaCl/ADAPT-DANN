@@ -1,5 +1,5 @@
 """
-Telemedicine preprocessing + backtranslation balancing (no downsampling).
+Telemedicine preprocessing + backtranslation balancing (balance FIRST, then split).
 
 Run on GPU:
     pip install -r requirements.txt
@@ -130,17 +130,7 @@ def load_and_preprocess():
     for label, count in df["label"].value_counts().items():
         print(f"  {label}: {count:,}")
     
-    train_df, test_df = train_test_split(
-        df, test_size=0.2, random_state=SEED, stratify=df["label"]
-    )
-    train_df = train_df.reset_index(drop=True)
-    test_df = test_df.reset_index(drop=True)
-    
-    print(f"\nSplit: train={len(train_df):,}, test={len(test_df):,}")
-    print_stats(train_df, "Train")
-    print_stats(test_df, "Test")
-    
-    return train_df, test_df
+    return df
 
 def load_models(device):
     print("\nLoading translation models...")
@@ -170,9 +160,9 @@ def backtranslate_id_en_id(texts, tokenizer_en, model_en, tokenizer_id, model_id
     id_texts = translate(en_texts, tokenizer_id, model_id, device)
     return id_texts
 
-def run_backtranslation(train_df, test_df):
+def balance_dataset(df):
     print("\n" + "=" * 60)
-    print(" BACKTRANSLATION BALANCING")
+    print(" BALANCING DATASET (before split)")
     print("=" * 60)
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -180,20 +170,20 @@ def run_backtranslation(train_df, test_df):
     if device == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
     
-    train_pos = train_df[train_df['label'] == 'POSITIVE']
-    train_neg = train_df[train_df['label'] == 'NEGATIVE']
+    pos_df = df[df['label'] == 'POSITIVE']
+    neg_df = df[df['label'] == 'NEGATIVE']
     
-    print(f"Train POSITIVE: {len(train_pos):,}")
-    print(f"Train NEGATIVE: {len(train_neg):,}")
+    print(f"POSITIVE: {len(pos_df):,}")
+    print(f"NEGATIVE: {len(neg_df):,}")
     
-    if len(train_pos) == len(train_neg):
+    if len(pos_df) == len(neg_df):
         print("Already balanced!")
-        return train_df, test_df
+        return df
     
-    minority_class = 'POSITIVE' if len(train_pos) < len(train_neg) else 'NEGATIVE'
+    minority_class = 'POSITIVE' if len(pos_df) < len(neg_df) else 'NEGATIVE'
     majority_class = 'NEGATIVE' if minority_class == 'POSITIVE' else 'POSITIVE'
-    minority_df = train_pos if minority_class == 'POSITIVE' else train_neg
-    majority_count = len(train_neg) if minority_class == 'POSITIVE' else len(train_pos)
+    minority_df = pos_df if minority_class == 'POSITIVE' else neg_df
+    majority_count = len(neg_df) if minority_class == 'POSITIVE' else len(pos_df)
     minority_count = len(minority_df)
     
     needed = majority_count - minority_count
@@ -225,26 +215,51 @@ def run_backtranslation(train_df, test_df):
         'label': [minority_class] * len(selected)
     })
     
-    train_balanced = pd.concat([train_df, new_rows], ignore_index=True)
-    train_balanced = train_balanced.sample(frac=1, random_state=SEED).reset_index(drop=True)
+    df_balanced = pd.concat([df, new_rows], ignore_index=True)
+    df_balanced = df_balanced.sample(frac=1, random_state=SEED).reset_index(drop=True)
     
-    print(f"\nFinal train distribution:")
-    print_stats(train_balanced, "Train")
-    print_stats(test_df, "Test")
+    print(f"\nBalanced dataset distribution:")
+    print_stats(df_balanced, "Balanced")
     
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    train_balanced.to_csv(OUTPUT_DIR / "train_balanced.csv", index=False)
-    test_df.to_csv(OUTPUT_DIR / "test_balanced.csv", index=False)
-    
-    print(f"\nSaved to {OUTPUT_DIR}/")
-    print(f"  train_balanced.csv ({len(train_balanced):,} rows)")
-    print(f"  test_balanced.csv ({len(test_df):,} rows)")
-    
-    return train_balanced, test_df
+    return df_balanced
 
 def main():
-    train_df, test_df = load_and_preprocess()
-    run_backtranslation(train_df, test_df)
+    # Step 1: Load and preprocess all data
+    df = load_and_preprocess()
+    
+    # Step 2: Balance the ENTIRE dataset first
+    df_balanced = balance_dataset(df)
+    
+    # Step 3: Save preprocessed balanced dataset
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    balanced_path = OUTPUT_DIR / "preprocessed_telemedicine.csv"
+    df_balanced.to_csv(balanced_path, index=False)
+    print(f"\nSaved balanced dataset to {balanced_path} ({len(df_balanced):,} rows)")
+    
+    # Step 4: Split into train/test (80/20, stratified)
+    print("\n" + "=" * 60)
+    print(" SPLITTING BALANCED DATASET")
+    print("=" * 60)
+    
+    train_df, test_df = train_test_split(
+        df_balanced, test_size=0.2, random_state=SEED, stratify=df_balanced["label"]
+    )
+    train_df = train_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
+    
+    print(f"\nTrain: {len(train_df):,} rows")
+    print(f"Test:  {len(test_df):,} rows")
+    print_stats(train_df, "Train")
+    print_stats(test_df, "Test")
+    
+    # Step 5: Save train/test splits
+    train_df.to_csv(OUTPUT_DIR / "train.csv", index=False)
+    test_df.to_csv(OUTPUT_DIR / "test.csv", index=False)
+    
+    print(f"\nSaved to {OUTPUT_DIR}/")
+    print(f"  preprocessed_telemedicine.csv ({len(df_balanced):,} rows) - FULL BALANCED DATASET")
+    print(f"  train.csv ({len(train_df):,} rows)")
+    print(f"  test.csv  ({len(test_df):,} rows)")
 
 if __name__ == "__main__":
     main()
