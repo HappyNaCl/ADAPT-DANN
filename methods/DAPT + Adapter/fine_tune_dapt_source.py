@@ -15,7 +15,10 @@ Pipeline:
   3. Evaluate on source + target test sets
 """
 
+import argparse
 import os
+import sys
+
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -31,6 +34,55 @@ from transformers import (
 )
 from datasets import Dataset
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
+
+
+# ---------- Verbose control ---------------------------------------------------
+# Default: only the compact 2-line header + 4-line summary is printed.
+# Pass --use-verbose to see the full training logs.
+_ORIG_STDOUT = sys.stdout
+USE_VERBOSE = False
+
+
+def set_verbose(verbose: bool):
+    """Silence stdout + library logs/progress bars unless verbose is set."""
+    global USE_VERBOSE
+    USE_VERBOSE = bool(verbose)
+    if USE_VERBOSE:
+        return
+    sys.stdout = open(os.devnull, 'w')
+    try:
+        from transformers.utils.logging import set_verbosity_error
+        set_verbosity_error()
+    except Exception:
+        pass
+    try:
+        from datasets.utils import disable_progress_bars
+        disable_progress_bars()
+    except Exception:
+        pass
+
+
+def print_summary(model_line: str, hparams_line: str, src: dict, tgt: dict):
+    """Compact summary — always printed, even in quiet mode."""
+    out = _ORIG_STDOUT
+    print(model_line, file=out)
+    print(hparams_line, file=out)
+    for key in ('accuracy', 'precision', 'recall', 'f1'):
+        s, t = src.get(key), tgt.get(key)
+        if s is None or t is None:
+            continue
+        print(f'{key}: source={s:.4f}  target={t:.4f}  gap={s - t:+.4f}', file=out)
+    out.flush()
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='Fine-tune DAPT model (no adapter) on SOURCE data.'
+    )
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--use-verbose', dest='use_verbose', action='store_true',
+                        help='Show all training logs (default: summary only)')
+    return parser.parse_args()
 
 
 def compute_metrics(eval_pred):
@@ -210,9 +262,9 @@ def run_tsne_visualization(model, tokenizer, source_test_df, target_test_df,
             ax.scatter(xs[mask], ys[mask], s=10, alpha=0.8, 
                       c=PALETTE[(dom, lab)], label=DISPLAY_NAMES[(dom, lab)])
         
-        ax.set_title(title, fontsize=18)
+        ax.set_title(title, fontsize=24)
         ax.grid(False)
-        ax.legend(loc='lower left', fontsize=14, frameon=True, markerscale=2)
+        ax.legend(loc='best', fontsize=18, frameon=True, markerscale=2)
         fig.tight_layout()
         
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -261,6 +313,9 @@ class DAPTClassifier(nn.Module):
 
 
 def main():
+    args = parse_args()
+    set_verbose(args.use_verbose)
+
     # ========================================================================
     # Check GPU availability
     # ========================================================================
@@ -358,7 +413,7 @@ def main():
         desc="Tokenizing"
     )
     
-    train_test_split = tokenized_dataset.train_test_split(test_size=0.2, seed=42)
+    train_test_split = tokenized_dataset.train_test_split(test_size=0.2, seed=args.seed)
     train_dataset = train_test_split['train']
     test_dataset = train_test_split['test']
     
@@ -377,7 +432,7 @@ def main():
     CLASSIFIER_LR = 1e-3
     
     training_args = TrainingArguments(
-        output_dir="./models/dapt_lazada_source_finetuned",
+        output_dir="../../dapt_lazada/",
         num_train_epochs=3,
         per_device_train_batch_size=32,
         per_device_eval_batch_size=32,
@@ -390,9 +445,11 @@ def main():
         metric_for_best_model="f1",
         greater_is_better=True,
         logging_steps=50,
+        disable_tqdm=not USE_VERBOSE,
         fp16=torch.cuda.is_available(),
         push_to_hub=False,
-        report_to="none"
+        report_to="none",
+        seed=args.seed,
     )
     
     # Custom optimizer with classifier LR
@@ -519,29 +576,6 @@ def main():
     )
     
     # ========================================================================
-    # Final Summary
-    # ========================================================================
-    print("\n" + "="*60)
-    print("FINAL SUMMARY - DAPT Only (No Adapter)")
-    print("="*60)
-    print(f"\nPipeline: MLM on target -> Fine-tune DAPT on SOURCE (frozen encoder, no adapter) -> Evaluate")
-    print(f"\n{'Metric':<12} {'Source':<15} {'Target':<15} {'Gap':<10}")
-    print("-"*52)
-    for metric in ['accuracy', 'precision', 'recall', 'f1']:
-        src_val = source_results[metric]
-        tgt_val = target_results[metric]
-        gap = src_val - tgt_val
-        print(f"{metric.capitalize():<12} {src_val:<15.4f} {tgt_val:<15.4f} {gap:<+10.4f}")
-    
-    print(f"\n{'Samples':<12} {source_results['samples']:<15} {target_results['samples']:<15}")
-    
-    print("\n" + "="*60)
-    print("Comparison with DAPT + Adapter:")
-    print("="*60)
-    print("DAPT + Adapter:  Source ~88.35%  Target ~79.24%  Gap ~9.12%")
-    print("DAPT Only:       Source  ?.??%   Target  ?.??%   Gap  ?.??%")
-    
-    # ========================================================================
     # t-SNE Visualization
     # ========================================================================
     print("\n" + "="*60)
@@ -564,6 +598,16 @@ def main():
     print("\n" + "="*60)
     print("All done!")
     print("="*60)
+
+    # Compact summary — always printed (this is the only output in quiet mode)
+    print_summary(
+        f"Model: DAPT-only, no adapter ({model_path})",
+        f"batch=32  max_len=128  epochs={int(training_args.num_train_epochs)}  "
+        f"lr={training_args.learning_rate:g}  wd={training_args.weight_decay}  "
+        f"seed={args.seed}",
+        source_results,
+        target_results,
+    )
 
 
 if __name__ == "__main__":

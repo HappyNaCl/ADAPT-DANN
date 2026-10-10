@@ -5,7 +5,10 @@ This script trains IndoBERT using Masked Language Modeling (MLM) on the target d
 (reviewContent from target_final.csv)
 """
 
+import argparse
 import os
+import sys
+
 import pandas as pd
 import torch
 import numpy as np
@@ -20,7 +23,46 @@ from transformers import (
 from datasets import Dataset
 
 
+# ---------- Verbose control ---------------------------------------------------
+# Default: only the compact 2-line header + final MLM metrics is printed.
+# Pass --use-verbose to see the full training logs.
+_ORIG_STDOUT = sys.stdout
+USE_VERBOSE = False
+
+
+def set_verbose(verbose: bool):
+    """Silence stdout + library logs/progress bars unless verbose is set."""
+    global USE_VERBOSE
+    USE_VERBOSE = bool(verbose)
+    if USE_VERBOSE:
+        return
+    sys.stdout = open(os.devnull, 'w')
+    try:
+        from transformers.utils.logging import set_verbosity_error
+        set_verbosity_error()
+    except Exception:
+        pass
+    try:
+        from datasets.utils import disable_progress_bars
+        disable_progress_bars()
+    except Exception:
+        pass
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='MLM domain-adaptive pretraining on target domain data.'
+    )
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--use-verbose', dest='use_verbose', action='store_true',
+                        help='Show all training logs (default: summary only)')
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    set_verbose(args.use_verbose)
+
     # ========================================================================
     # Check GPU availability
     # ========================================================================
@@ -104,7 +146,7 @@ def main():
     print(f"Tokenized dataset features: {tokenized_dataset.features}")
     
     # Split dataset into train and validation (90/10 split)
-    train_test_split = tokenized_dataset.train_test_split(test_size=0.1, seed=42)
+    train_test_split = tokenized_dataset.train_test_split(test_size=0.1, seed=args.seed)
     train_dataset = train_test_split['train']
     eval_dataset = train_test_split['test']
     
@@ -148,6 +190,8 @@ def main():
         metric_for_best_model="loss",
         greater_is_better=False,
         push_to_hub=False,
+        disable_tqdm=not USE_VERBOSE,
+        seed=args.seed,
         report_to="none"  # Disable wandb/tensorboard
     )
     
@@ -282,6 +326,19 @@ def main():
     print("\n" + "="*60)
     print("All done!")
     print("="*60)
+
+    # Compact summary — always printed (this is the only output in quiet mode).
+    # MLM has no source/target accuracy; report the final validation metrics.
+    _out = _ORIG_STDOUT
+    print(f"Model: IndoBERT MLM-DAPT (indolem/indobert-base-uncased)", file=_out)
+    print(f"batch={training_args.per_device_train_batch_size}  "
+          f"max_len=128  epochs={int(training_args.num_train_epochs)}  "
+          f"lr={training_args.learning_rate:g}  wd={training_args.weight_decay}  "
+          f"seed={args.seed}", file=_out)
+    print(f"val_loss: {eval_results['eval_loss']:.4f}  "
+          f"perplexity: {np.exp(eval_results['eval_loss']):.4f}  "
+          f"train_loss: {train_result.training_loss:.4f}", file=_out)
+    _out.flush()
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ Methods:
     Adapter        UDApter TS-DT (MMD), base IndoBERT, adapters library
     DANN           base IndoBERT, full fine-tune, GRL adversarial joint loss
     DAPT+Adapter   DAPT backbone, frozen encoder, adapter + top-4 unfreeze
-    DANN+Adapter   base IndoBERT, frozen encoder, domain adapter GRL, task adapter
+    DANN+Adapter   base IndoBERT, joint cls + GRL domain loss, label/domain adapters
     ADAPT-DANN     DAPT backbone, 3-stage sequential pipeline
 
 NOTE: DAPT model must already exist at <project_root>/dapt_lazada/
@@ -23,6 +23,47 @@ NOTE: DAPT model must already exist at <project_root>/dapt_lazada/
 
 import os, sys, math, random, itertools, shutil
 from pathlib import Path
+
+# ---------- Verbose control ---------------------------------------------------
+# Default: only the compact per-seed summary + final tables are printed.
+# Pass --use-verbose to see the full training logs.
+_ORIG_STDOUT = sys.stdout
+USE_VERBOSE = False
+
+
+def set_verbose(verbose: bool):
+    """Silence stdout + library logs/progress bars unless verbose is set."""
+    global USE_VERBOSE
+    USE_VERBOSE = bool(verbose)
+    if USE_VERBOSE:
+        return
+    sys.stdout = open(os.devnull, 'w')
+    try:
+        from transformers.utils.logging import set_verbosity_error
+        set_verbosity_error()
+    except Exception:
+        pass
+    try:
+        from datasets.utils import disable_progress_bars
+        disable_progress_bars()
+    except Exception:
+        pass
+
+
+def print_summary(model_line: str, hparams_line: str, src: dict, tgt: dict):
+    """Compact summary — always printed, even in quiet mode."""
+    out = _ORIG_STDOUT
+    print(model_line, file=out)
+    print(hparams_line, file=out)
+    for key in ('accuracy', 'precision', 'recall', 'f1'):
+        s, t = src.get(key), tgt.get(key)
+        if s is None:
+            s, t = src.get('acc'), tgt.get('acc')   # eval_metrics() short alias
+        if s is None or t is None:
+            continue
+        print(f'{key}: source={s:.4f}  target={t:.4f}  gap={s - t:+.4f}', file=out)
+    out.flush()
+
 
 import numpy as np
 import pandas as pd
@@ -61,14 +102,25 @@ EPOCHS       = 3
 LR           = 1e-5
 TASK_LR      = 1e-3
 WD           = 0.02
-WARMUP_RATIO = 0.1
 DROPOUT      = 0.2
 ADAPTER_DIM  = 16
 MAX_GRAD     = 1.0
-LABEL_SMOOTH = 0.0
 UNFREEZE_TOP = 4
-VAL_SPLIT    = 0.15
-DOMAIN_LW    = 0.1   # DANN domain loss weight
+VAL_SPLIT    = 0.10  # Table I "All: Val split 10%"
+DOMAIN_LW    = 0.1   # DANN / DANN+Adapter domain loss weight
+PATIENCE     = 3
+
+# Per-method warmup / label smoothing (Table I; FT and DAPT+Adapter not listed -> original code)
+FT_WARMUP          = 0.0
+DANN_WARMUP        = 0.05
+MMD_WARMUP         = 0.02
+MMD_LABEL_SMOOTH   = 0.05
+DA_WARMUP          = 0.1
+DA_VAL_SPLIT       = 0.20
+DA_ENCODER_LR      = 5e-6  # unfrozen top-4 layers; from methods/DAPT + Adapter/fine_tune_dapt_adapter_source.py
+DANN_AD_WARMUP     = 0.02
+ADAPT_DANN_WARMUP  = 0.02
+ADAPT_DANN_LS      = 0.05
 
 SEEDS   = [42, 84, 123, 256, 512]
 METHODS = ['IndoBERT', 'DAPT', 'Adapter', 'DANN', 'DAPT+Adapter', 'DANN+Adapter', 'ADAPT-DANN']
@@ -237,7 +289,10 @@ def run_hf_finetune(seed, backbone_path, method_name, work_dir):
         ds = HFDataset.from_dict({'text': df[tc].tolist(), 'label': df['label_id'].tolist()})
         return ds.map(tok_fn, batched=True, remove_columns=['text'])
 
-    train_ds    = make_hf_ds(train_df)
+    from sklearn.model_selection import train_test_split as tts
+    tr_df, val_df = tts(train_df, test_size=VAL_SPLIT, stratify=train_df['label_id'], random_state=seed)
+    train_ds    = make_hf_ds(tr_df)
+    val_ds      = make_hf_ds(val_df)
     src_test_ds = make_hf_ds(src_test_df)
     tgt_test_ds = make_hf_ds(tgt_test_df)
 
@@ -255,13 +310,16 @@ def run_hf_finetune(seed, backbone_path, method_name, work_dir):
         per_device_eval_batch_size=BATCH_SIZE,
         learning_rate=LR,
         weight_decay=WD,
-        warmup_ratio=WARMUP_RATIO,
+        warmup_ratio=FT_WARMUP,
         eval_strategy='epoch',
         save_strategy='epoch',
+        save_only_model=True,   # skip optimizer state (~1.3GB per checkpoint); disk is tight
+        save_total_limit=1,     # keeps best + latest only
         load_best_model_at_end=True,
         metric_for_best_model='f1',
         greater_is_better=True,
         logging_steps=100,
+        disable_tqdm=not USE_VERBOSE,
         fp16=torch.cuda.is_available(),
         push_to_hub=False,
         report_to='none',
@@ -272,11 +330,15 @@ def run_hf_finetune(seed, backbone_path, method_name, work_dir):
         model=model,
         args=args,
         train_dataset=train_ds,
-        eval_dataset=src_test_ds,
+        eval_dataset=val_ds,
         data_collator=DataCollatorWithPadding(tokenizer),
         compute_metrics=compute_metrics,
     )
-    trainer.train()
+    try:
+        trainer.train()
+    except Exception:
+        shutil.rmtree(out, ignore_errors=True)
+        raise
 
     def get_metrics(ds):
         out = trainer.predict(ds)
@@ -333,6 +395,7 @@ def run_adapter_mmd(seed, work_dir):
     domain_cfg = AdapterConfig.load('pfeiffer', reduction_factor=ADAPTER_DIM)
     model.add_adapter(DOMAIN_ADAPTER, config=domain_cfg)
     model.train_adapter(DOMAIN_ADAPTER)
+    model.to(device)  # new adapter weights are created on CPU
 
     collator = DataCollatorWithPadding(tokenizer, return_tensors='pt')
     g1 = torch.Generator(); g1.manual_seed(seed)
@@ -344,15 +407,17 @@ def run_adapter_mmd(seed, work_dir):
 
     opt_d = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=LR, weight_decay=WD)
     steps = max(len(src_dom_loader), len(tgt_dom_loader))
-    sch_d = get_cosine_schedule_with_warmup(opt_d, int(WARMUP_RATIO * steps * EPOCHS), steps * EPOCHS)
+    sch_d = get_cosine_schedule_with_warmup(opt_d, int(MMD_WARMUP * steps * EPOCHS), steps * EPOCHS)
 
     def mmd_loss(s, t, mul=2.0, num=5):
+        # as in methods/adapter/Adapter_V2_with_tsne.ipynb; source/target batch sizes may differ
         bs  = s.size(0)
+        n   = s.size(0) + t.size(0)
         tot = torch.cat([s, t], 0)
-        t0  = tot.unsqueeze(0).expand(bs * 2, bs * 2, -1)
-        t1  = tot.unsqueeze(1).expand(bs * 2, bs * 2, -1)
+        t0  = tot.unsqueeze(0).expand(n, n, -1)
+        t1  = tot.unsqueeze(1).expand(n, n, -1)
         L2  = ((t0 - t1) ** 2).sum(2)
-        bw  = torch.sum(L2.detach()) / (4 * bs * bs - 2 * bs)
+        bw  = torch.sum(L2.detach()) / (n * n - n)
         bws = [bw / (mul ** (num // 2)) * (mul ** i) for i in range(num)]
         K   = sum(torch.exp(-L2 / b) for b in bws)
         return K[:bs, :bs].mean() + K[bs:, bs:].mean() - 2 * K[:bs, bs:].mean()
@@ -377,8 +442,9 @@ def run_adapter_mmd(seed, work_dir):
     task_cfg = AdapterConfig.load('pfeiffer', reduction_factor=ADAPTER_DIM)
     model.add_adapter(TASK_ADAPTER, config=task_cfg)
     model.add_classification_head(TASK_ADAPTER, num_labels=2, id2label=ID2LABEL)
+    model.train_adapter(TASK_ADAPTER)  # note: resets active adapters, so set Stack after
     model.active_adapters = Stack(DOMAIN_ADAPTER, TASK_ADAPTER)
-    model.train_adapter(TASK_ADAPTER)
+    model.to(device)  # move task adapter + head to device
 
     def tok_labeled(df):
         ds = HFDataset.from_dict({'text': df[tc].tolist(), 'labels': df['label_id'].tolist()})
@@ -397,9 +463,9 @@ def run_adapter_mmd(seed, work_dir):
     task_loader = DataLoader(train_task_ds, batch_size=BATCH_SIZE, shuffle=True,
                              collate_fn=collator, generator=g3)
 
-    loss_fn = nn.CrossEntropyLoss(weight=cw, label_smoothing=LABEL_SMOOTH)
+    loss_fn = nn.CrossEntropyLoss(weight=cw, label_smoothing=MMD_LABEL_SMOOTH)
     opt_t   = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=TASK_LR, weight_decay=WD)
-    sch_t   = get_cosine_schedule_with_warmup(opt_t, int(WARMUP_RATIO * len(task_loader) * EPOCHS),
+    sch_t   = get_cosine_schedule_with_warmup(opt_t, int(MMD_WARMUP * len(task_loader) * EPOCHS),
                                                len(task_loader) * EPOCHS)
 
     for _ in range(EPOCHS):
@@ -490,7 +556,7 @@ def run_dann(seed, backbone_path, work_dir):
     opt    = AdamW(model.parameters(), lr=LR, weight_decay=WD)
     steps  = min(len(src_loader), len(tgt_loader))
     total  = steps * EPOCHS
-    sch    = get_linear_schedule_with_warmup(opt, int(WARMUP_RATIO * total), total)
+    sch    = get_linear_schedule_with_warmup(opt, int(DANN_WARMUP * total), total)
 
     best_f1, best_state, gs = -1.0, None, 0
     for epoch in range(EPOCHS):
@@ -587,16 +653,16 @@ def run_dapt_adapter(seed, work_dir):
     unfreeze_top_layers(model.encoder, UNFREEZE_TOP)
 
     from sklearn.model_selection import train_test_split as tts
-    tr_df, val_df = tts(train_df, test_size=VAL_SPLIT, stratify=train_df['label_id'], random_state=seed)
+    tr_df, val_df = tts(train_df, test_size=DA_VAL_SPLIT, stratify=train_df['label_id'], random_state=seed)
 
     cw = class_weights(train_df, device)
-    loss_fn = nn.CrossEntropyLoss(weight=cw, label_smoothing=LABEL_SMOOTH)
+    loss_fn = nn.CrossEntropyLoss(weight=cw)
 
     frozen_enc = [p for p in model.encoder.parameters() if p.requires_grad]
     opt = AdamW([
         {'params': model.adapter.parameters(), 'lr': LR},
         {'params': model.cls.parameters(),     'lr': TASK_LR},
-        {'params': frozen_enc,                 'lr': LR},
+        {'params': frozen_enc,                 'lr': DA_ENCODER_LR},
     ], weight_decay=WD)
 
     g = torch.Generator(); g.manual_seed(seed)
@@ -606,9 +672,9 @@ def run_dapt_adapter(seed, work_dir):
                             batch_size=BATCH_SIZE)
 
     total = EPOCHS * len(tr_loader)
-    sch   = get_cosine_schedule_with_warmup(opt, int(WARMUP_RATIO * total), total)
+    sch   = get_cosine_schedule_with_warmup(opt, int(DA_WARMUP * total), total)
 
-    best_loss, best_state, patience, wait = float('inf'), None, 3, 0
+    best_loss, best_state, patience, wait = float('inf'), None, PATIENCE, 0
     for epoch in range(EPOCHS):
         model.train()
         for b in tr_loader:
@@ -696,8 +762,8 @@ class TaskAdapterClassifier(nn.Module):
         return self.cls(feat)
 
 
-def run_dann_adapter(seed, backbone_path, work_dir):
-    """DANN+Adapter: base IndoBERT frozen encoder, domain adapter GRL, task adapter."""
+def run_two_stage_adapter(seed, backbone_path, work_dir):
+    """ADAPT-DANN stages 2-3: frozen encoder, domain adapter GRL, then task adapter."""
     set_seed(seed)
     device = get_device()
 
@@ -729,7 +795,7 @@ def run_dann_adapter(seed, backbone_path, work_dir):
     opt_d  = AdamW(list(dann_model.adapter.parameters()) + list(dann_model.domain_cls.parameters()),
                    lr=LR, weight_decay=WD)
     total_d = EPOCHS * steps
-    sch_d   = get_cosine_schedule_with_warmup(opt_d, int(WARMUP_RATIO * total_d), total_d)
+    sch_d   = get_cosine_schedule_with_warmup(opt_d, int(ADAPT_DANN_WARMUP * total_d), total_d)
 
     gs = 0
     for _ in range(EPOCHS):
@@ -764,7 +830,7 @@ def run_dann_adapter(seed, backbone_path, work_dir):
     tr_df, val_df = tts(train_df, test_size=VAL_SPLIT, stratify=train_df['label_id'], random_state=seed)
 
     cw      = class_weights(train_df, device)
-    loss_fn = nn.CrossEntropyLoss(weight=cw, label_smoothing=LABEL_SMOOTH)
+    loss_fn = nn.CrossEntropyLoss(weight=cw, label_smoothing=ADAPT_DANN_LS)
 
     g3 = torch.Generator(); g3.manual_seed(seed)
     tr_loader  = DataLoader(TextDataset(tr_df[tc].tolist(), tokenizer, labels=tr_df['label_id'].tolist()),
@@ -779,9 +845,9 @@ def run_dann_adapter(seed, backbone_path, work_dir):
         {'params': frozen_enc_params,                  'lr': LR},
     ], weight_decay=WD)
     total_t = EPOCHS * len(tr_loader)
-    sch_t   = get_cosine_schedule_with_warmup(opt_t, int(WARMUP_RATIO * total_t), total_t)
+    sch_t   = get_cosine_schedule_with_warmup(opt_t, int(ADAPT_DANN_WARMUP * total_t), total_t)
 
-    best_loss, best_state, patience, wait = float('inf'), None, 3, 0
+    best_loss, best_state, patience, wait = float('inf'), None, PATIENCE, 0
     for _ in range(EPOCHS):
         task_model.train()
         for b in tr_loader:
@@ -825,6 +891,118 @@ def run_dann_adapter(seed, backbone_path, work_dir):
     return src, tgt
 
 
+class DANNAdapterModel(nn.Module):
+    """DANN with a label adapter before the sentiment head and a domain adapter before the GRL."""
+    def __init__(self, model_name, adapter_dim=ADAPTER_DIM, dropout=DROPOUT):
+        super().__init__()
+        self.encoder = AutoModel.from_pretrained(str(model_name))
+        H = self.encoder.config.hidden_size
+        self.drop          = nn.Dropout(dropout)
+        self.label_adapter  = PfeifferAdapter(H, adapter_dim, dropout)
+        self.domain_adapter = PfeifferAdapter(H, adapter_dim, dropout)
+        self.label_cls = nn.Sequential(
+            nn.Linear(H, H // 2), nn.ReLU(), nn.Dropout(0.2), nn.Linear(H // 2, 2)
+        )
+        self.grl = GRL()
+        self.domain_cls = nn.Sequential(
+            nn.Linear(H, H), nn.ReLU(), nn.Dropout(dropout), nn.Linear(H, 2)
+        )
+
+    def forward(self, ids, mask, alpha=1.0):
+        feat = self.drop(self.encoder(input_ids=ids, attention_mask=mask).last_hidden_state[:, 0])
+        cls  = self.label_cls(self.label_adapter(feat))
+        dom  = self.domain_cls(self.grl(self.domain_adapter(feat), alpha))
+        return cls, dom
+
+
+def run_dann_adapter(seed, backbone_path, work_dir):
+    """DANN+Adapter: joint sentiment + adversarial domain loss with adapters (no DAPT)."""
+    set_seed(seed)
+    device = get_device()
+
+    train_df, tc = load_labeled_csv(SOURCE_TRAIN_CSV)
+    src_test_df, _ = load_labeled_csv(SOURCE_TEST_CSV)
+    tgt_test_df, _ = load_labeled_csv(TARGET_TEST_CSV)
+    tgt_df, ttc   = load_unlabeled_csv(TARGET_TRAIN_CSV)
+
+    tokenizer = AutoTokenizer.from_pretrained(str(backbone_path))
+    model     = DANNAdapterModel(backbone_path).to(device)
+
+    from sklearn.model_selection import train_test_split as tts
+    tr_df, val_df = tts(train_df, test_size=VAL_SPLIT, stratify=train_df['label_id'], random_state=seed)
+
+    g1 = torch.Generator(); g1.manual_seed(seed)
+    g2 = torch.Generator(); g2.manual_seed(seed + 1)
+    src_loader = DataLoader(TextDataset(tr_df[tc].tolist(), tokenizer, labels=tr_df['label_id'].tolist()),
+                            batch_size=BATCH_SIZE, shuffle=True, generator=g1)
+    tgt_loader = DataLoader(TextDataset(tgt_df[ttc].tolist(), tokenizer),
+                            batch_size=BATCH_SIZE, shuffle=True, generator=g2)
+    val_loader = DataLoader(TextDataset(val_df[tc].tolist(), tokenizer, labels=val_df['label_id'].tolist()),
+                            batch_size=BATCH_SIZE)
+
+    cls_fn = nn.CrossEntropyLoss()
+    dom_fn = nn.CrossEntropyLoss()
+    opt    = AdamW(model.parameters(), lr=LR, weight_decay=WD)
+    steps  = min(len(src_loader), len(tgt_loader))
+    total  = steps * EPOCHS
+    sch    = get_linear_schedule_with_warmup(opt, int(DANN_AD_WARMUP * total), total)
+
+    best_f1, best_state, gs = -1.0, None, 0
+    for _ in range(EPOCHS):
+        model.train()
+        si = iter(src_loader); ti = iter(tgt_loader)
+        for _ in range(steps):
+            p     = float(gs) / max(1, total - 1)
+            alpha = 2.0 / (1.0 + math.exp(-10 * p)) - 1.0
+            sb = next(si); tb = next(ti)
+            s_ids, s_mask = sb['input_ids'].to(device), sb['attention_mask'].to(device)
+            t_ids, t_mask = tb['input_ids'].to(device), tb['attention_mask'].to(device)
+            s_lab = sb['labels'].to(device)
+
+            cls_logits, s_dom = model(s_ids, s_mask, alpha)
+            _, t_dom          = model(t_ids, t_mask, alpha)
+
+            loss = cls_fn(cls_logits, s_lab) + DOMAIN_LW * 0.5 * (
+                dom_fn(s_dom, torch.zeros(s_dom.size(0), dtype=torch.long, device=device)) +
+                dom_fn(t_dom, torch.ones(t_dom.size(0), dtype=torch.long, device=device))
+            )
+            opt.zero_grad(); loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), MAX_GRAD)
+            opt.step(); sch.step(); gs += 1
+
+        model.eval()
+        preds, labels = [], []
+        with torch.no_grad():
+            for b in val_loader:
+                logits, _ = model(b['input_ids'].to(device), b['attention_mask'].to(device), alpha=0.0)
+                preds.extend(logits.argmax(1).cpu().tolist())
+                labels.extend(b['labels'].tolist())
+        f1 = precision_recall_fscore_support(labels, preds, average='weighted')[2]
+        if f1 > best_f1:
+            best_f1 = f1
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+
+    model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    model.eval()
+
+    def ev(df_ev, tc_ev):
+        loader = DataLoader(TextDataset(df_ev[tc_ev].tolist(), tokenizer,
+                                        labels=df_ev['label_id'].tolist()), batch_size=BATCH_SIZE)
+        preds, labels = [], []
+        with torch.no_grad():
+            for b in loader:
+                logits, _ = model(b['input_ids'].to(device), b['attention_mask'].to(device), alpha=0.0)
+                preds.extend(logits.argmax(1).cpu().tolist())
+                labels.extend(b['labels'].tolist())
+        return eval_metrics(preds, labels)
+
+    src = ev(src_test_df, tc)
+    tgt = ev(tgt_test_df, tc)
+    del model
+    return src, tgt
+
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Method 7: ADAPT-DANN (DAPT backbone, 3-stage pipeline)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -832,7 +1010,7 @@ def run_dann_adapter(seed, backbone_path, work_dir):
 def run_adapt_dann(seed, work_dir):
     """ADAPT-DANN: DAPT backbone → domain adapter GRL → task adapter."""
     # Same as DANN+Adapter but uses DAPT model as backbone (Stage 1 already done)
-    return run_dann_adapter(seed, DAPT_MODEL_DIR, work_dir)
+    return run_two_stage_adapter(seed, DAPT_MODEL_DIR, work_dir)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -846,7 +1024,12 @@ def run_all(seeds=SEEDS, methods=METHODS):
         print(f'WARNING: DAPT model not found at {DAPT_MODEL_DIR}')
         print('Methods requiring DAPT (DAPT, DAPT+Adapter, ADAPT-DANN) will be skipped.')
 
-    records = []
+    raw_path = OUTPUT_DIR / 'all_methods_raw.csv'
+    records  = []
+    if raw_path.exists():  # keep earlier results of methods not being rerun
+        prev    = pd.read_csv(raw_path)
+        records = prev[~prev['method'].isin(methods)].to_dict('records')
+
     for method in methods:
         print(f'\n{"="*60}')
         print(f'METHOD: {method}')
@@ -893,12 +1076,25 @@ def run_all(seeds=SEEDS, methods=METHODS):
                 })
                 print(f'  src_f1={src["f1"]:.4f}  tgt_f1={tgt["f1"]:.4f}')
 
+                # Compact per-seed summary (always printed, even in quiet mode)
+                _backbone = str(DAPT_MODEL_DIR) if method in ('DAPT', 'DAPT+Adapter', 'ADAPT-DANN') \
+                    else BASE_MODEL_NAME
+                print_summary(
+                    f'Model: {method} ({_backbone})',
+                    f'batch={BATCH_SIZE}  max_len={MAX_LENGTH}  epochs={EPOCHS}  '
+                    f'lr={LR:g}  wd={WD}  seed={seed}',
+                    src, tgt,
+                )
+
                 # Save incrementally after every run
                 pd.DataFrame(records).to_csv(OUTPUT_DIR / 'all_methods_raw.csv', index=False)
 
             except Exception as e:
                 print(f'  ERROR seed={seed} method={method}: {e}')
                 import traceback; traceback.print_exc()
+
+    # Restore stdout so the final tables are always visible in quiet mode
+    sys.stdout = _ORIG_STDOUT
 
     raw_df = pd.DataFrame(records)
     raw_df.to_csv(OUTPUT_DIR / 'all_methods_raw.csv', index=False)
@@ -928,13 +1124,17 @@ def run_all(seeds=SEEDS, methods=METHODS):
 
 
 if __name__ == '__main__':
+    sys.stdout.reconfigure(line_buffering=True)  # progress lines show up in the log immediately
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--methods', nargs='+', default=METHODS,
                         help='Methods to run (default: all 7)')
     parser.add_argument('--seeds', nargs='+', type=int, default=SEEDS,
                         help='Seeds to use (default: 42 84 123 256 512)')
+    parser.add_argument('--use-verbose', dest='use_verbose', action='store_true',
+                        help='Show all training logs (default: summary only)')
     args = parser.parse_args()
+    set_verbose(args.use_verbose)
 
     print(f'Project root : {PROJECT_ROOT}')
     print(f'DAPT model   : {DAPT_MODEL_DIR} (exists={DAPT_MODEL_DIR.exists()})')

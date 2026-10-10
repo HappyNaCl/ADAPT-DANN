@@ -221,9 +221,9 @@ def plot_tsne(proj: np.ndarray, labels: np.ndarray, domains: np.ndarray,
             alpha=0.8,
         )
 
-    ax.set_title(title, fontsize=18)
+    ax.set_title(title, fontsize=24)
     ax.grid(False)
-    ax.legend(loc="lower left", fontsize=14, frameon=True, markerscale=2)
+    ax.legend(loc='best', fontsize=18, frameon=True, markerscale=2)
     fig.tight_layout()
 
     os.makedirs(os.path.dirname(outpath), exist_ok=True)

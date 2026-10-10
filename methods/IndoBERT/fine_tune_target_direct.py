@@ -11,7 +11,10 @@ Setup matches DANN v2:
   - Target (unlabeled during DANN, but used for eval here): Lazada
 """
 
+import argparse
 import os
+import sys
+
 import pandas as pd
 import torch
 import numpy as np
@@ -30,6 +33,45 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
 )
+
+
+# ---------- Verbose control ---------------------------------------------------
+# Default: only the compact 2-line header + 4-line summary is printed.
+# Pass --use-verbose to see the full training logs.
+_ORIG_STDOUT = sys.stdout
+USE_VERBOSE = False
+
+
+def set_verbose(verbose: bool):
+    """Silence stdout + library logs/progress bars unless verbose is set."""
+    global USE_VERBOSE
+    USE_VERBOSE = bool(verbose)
+    if USE_VERBOSE:
+        return
+    sys.stdout = open(os.devnull, 'w')
+    try:
+        from transformers.utils.logging import set_verbosity_error
+        set_verbosity_error()
+    except Exception:
+        pass
+    try:
+        from datasets.utils import disable_progress_bars
+        disable_progress_bars()
+    except Exception:
+        pass
+
+
+def print_summary(model_line: str, hparams_line: str, src: dict, tgt: dict):
+    """Compact summary — always printed, even in quiet mode."""
+    out = _ORIG_STDOUT
+    print(model_line, file=out)
+    print(hparams_line, file=out)
+    for key in ('accuracy', 'precision', 'recall', 'f1'):
+        s, t = src.get(key), tgt.get(key)
+        if s is None or t is None:
+            continue
+        print(f'{key}: source={s:.4f}  target={t:.4f}  gap={s - t:+.4f}', file=out)
+    out.flush()
 
 
 # ============================================================================
@@ -61,6 +103,16 @@ VAL_SIZE        = 0.15
 SEED            = 42
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='IndoBERT baseline: fine-tune on source, evaluate on source + target.'
+    )
+    parser.add_argument('--seed', type=int, default=SEED)
+    parser.add_argument('--use-verbose', dest='use_verbose', action='store_true',
+                        help='Show all training logs (default: summary only)')
+    return parser.parse_args()
+
+
 # ============================================================================
 # Metrics
 # ============================================================================
@@ -83,6 +135,9 @@ def compute_metrics(eval_pred):
 # Main
 # ============================================================================
 def main():
+    args = parse_args()
+    set_verbose(args.use_verbose)
+
     # ---- Device ----
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device : {device}")
@@ -144,7 +199,7 @@ def main():
 
     # --- Split source train into train / val ---
     train_df, val_df = train_test_split(
-        train_df, test_size=VAL_SIZE, stratify=train_df["label_id"], random_state=SEED
+        train_df, test_size=VAL_SIZE, stratify=train_df["label_id"], random_state=args.seed
     )
 
     print(f"\nSplit  : train={len(train_df)}  val={len(val_df)}  source_test={len(source_test_df)}  target_test={len(target_test_df)}")
@@ -215,10 +270,11 @@ def main():
         greater_is_better=True,
         logging_steps=50,
         logging_dir=os.path.join(OUTPUT_DIR, "logs"),
+        disable_tqdm=not USE_VERBOSE,
         fp16=torch.cuda.is_available(),
         push_to_hub=False,
         report_to="none",
-        seed=SEED,
+        seed=args.seed,
     )
 
     for key in ["num_train_epochs", "per_device_train_batch_size",
@@ -357,6 +413,7 @@ def main():
                 print(f"  {f:40s} {size_mb:.2f} MB")
 
     # ---- Summary ----
+    # Detailed (verbose-only) run info:
     print("\n" + "=" * 60)
     print("SUMMARY")
     print("=" * 60)
@@ -384,6 +441,17 @@ def main():
     print(f"\nTo load the saved model:")
     print(f"  model = AutoModelForSequenceClassification.from_pretrained('{final_dir}')")
     print(f"  tokenizer = AutoTokenizer.from_pretrained('{final_dir}')")
+
+    # Compact summary — always printed (this is the only output in quiet mode)
+    print_summary(
+        f"Model: IndoBERT baseline ({BASE_MODEL})",
+        f"batch={TRAIN_BATCH}  max_len={MAX_LENGTH}  epochs={NUM_EPOCHS}  "
+        f"lr={LEARNING_RATE:g}  wd={WEIGHT_DECAY}  seed={args.seed}",
+        {"accuracy": source_accuracy, "precision": source_precision,
+         "recall": source_recall, "f1": source_f1},
+        {"accuracy": target_accuracy, "precision": target_precision,
+         "recall": target_recall, "f1": target_f1},
+    )
 
 
 if __name__ == "__main__":

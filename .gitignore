@@ -1,2 +1,30 @@
-models
+# --- Pre-trained models / checkpoints ---
+models/
 dapt_lazada
+
+# --- Datasets (raw + preprocessed) ---
+datasets/
+
+# --- Training results ---
+results/
+results.txt
+
+# --- Run outputs / scratch ---
+outputs/
+
+# --- Logs ---
+logs/
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# --- Model / training artifacts ---
+checkpoint-*/
+wandb/
+*.ckpt
+*.pt
+*.safetensors
+*.bin

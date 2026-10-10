@@ -17,7 +17,11 @@ Key difference from fine_tune_dapt_adapter_target.py:
   - Matches the dapt_adapter.ipynb approach
 """
 
+import argparse
+import math
 import os
+import sys
+
 import pandas as pd
 import torch
 import torch.nn as nn
@@ -30,9 +34,96 @@ from transformers import (
     TrainingArguments,
     DataCollatorWithPadding,
     get_cosine_schedule_with_warmup,
+    set_seed,
 )
 from datasets import Dataset
+from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
+
+
+# ---------- Verbose control ---------------------------------------------------
+# Default: only the compact 2-line header + 4-line summary is printed.
+# Pass --use-verbose to see the full training logs.
+_ORIG_STDOUT = sys.stdout
+USE_VERBOSE = False
+
+
+def set_verbose(verbose: bool):
+    """Silence stdout + library logs/progress bars unless verbose is set."""
+    global USE_VERBOSE
+    USE_VERBOSE = bool(verbose)
+    if USE_VERBOSE:
+        return
+    sys.stdout = open(os.devnull, 'w')
+    try:
+        from transformers.utils.logging import set_verbosity_error
+        set_verbosity_error()
+    except Exception:
+        pass
+    try:
+        from datasets.utils import disable_progress_bars
+        disable_progress_bars()
+    except Exception:
+        pass
+
+
+def print_summary(model_line: str, hparams_line: str, src: dict, tgt: dict):
+    """Compact summary — always printed, even in quiet mode."""
+    out = _ORIG_STDOUT
+    print(model_line, file=out)
+    print(hparams_line, file=out)
+    for key in ('accuracy', 'precision', 'recall', 'f1'):
+        s, t = src.get(key), tgt.get(key)
+        if s is None or t is None:
+            continue
+        print(f'{key}: source={s:.4f}  target={t:.4f}  gap={s - t:+.4f}', file=out)
+    out.flush()
+
+
+# ---------- Training configuration (same key names as ADAPT-DANN's PIPE_CFG) ----------
+# Note: this baseline has NO domain adapter. DAPT here = MLM-pretrained backbone
+# (dapt_model_dir); only a single task adapter + classifier head is trained.
+CFG = {
+'dapt_model_dir':           '../../dapt_lazada',
+'source_labeled_csv':       '../../datasets/telemedicine_preprocessed/train.csv',
+'source_test_csv':          '../../datasets/telemedicine_preprocessed/test.csv',
+'target_eval_csv':          '../../datasets/lazada_test_preprocessed.csv',
+'output_dir':               './models/dapt_lazada_adapter_source_finetuned',
+
+'batch_size':               32,
+'max_length':               128,
+'epochs_task':              3,
+'learning_rate':            1e-5,   # encoder LR (unfrozen top layers)
+'task_adapter_lr':          1e-3,   # task adapter LR
+'classifier_lr':            1e-3,   # classifier head LR
+'weight_decay':             0.02,
+'warmup_ratio':             0.1,
+'dropout':                  0.2,
+'task_adapter_dim':         16,
+'max_grad_norm':            1.0,
+'unfreeze_top_layers':      4,
+'val_split':                0.15,
+'logging_steps':            50,
+'seed':                     42,
+}
+
+
+def parse_args():
+    """CLI overrides: python fine_tune_dapt_adapter_source.py --seed 84 --task_adapter_lr 5e-4 ..."""
+    parser = argparse.ArgumentParser(
+        description='Fine-tune DAPT + Adapter on SOURCE data (adapter-only).',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument('--use-verbose', dest='use_verbose', action='store_true',
+                        help='Show all training logs (default: summary only)')
+    for k, v in CFG.items():
+        parser.add_argument(f'--{k}', type=type(v), default=None)
+    args = parser.parse_args()
+    for k in CFG:
+        v = getattr(args, k)
+        if v is not None:
+            CFG[k] = v
+    return args
 
 
 def compute_metrics(eval_pred):
@@ -282,9 +373,9 @@ def run_tsne_visualization(model, tokenizer, source_test_df, target_test_df,
             ax.scatter(xs[mask], ys[mask], s=10, alpha=0.8, 
                       c=PALETTE[(dom, lab)], label=DISPLAY_NAMES[(dom, lab)])
         
-        ax.set_title(title, fontsize=18)
+        ax.set_title(title, fontsize=24)
         ax.grid(False)
-        ax.legend(loc='lower left', fontsize=14, frameon=True, markerscale=2)
+        ax.legend(loc='best', fontsize=18, frameon=True, markerscale=2)
         fig.tight_layout()
         
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
@@ -297,6 +388,12 @@ def run_tsne_visualization(model, tokenizer, source_test_df, target_test_df,
 
 
 def main():
+    args = parse_args()
+    set_verbose(args.use_verbose)
+    # Seed before building the model so adapter/classifier init is reproducible
+    # (same as ADAPT-DANN's set_seed(cfg['seed']) before model construction).
+    set_seed(CFG['seed'])
+
     # ========================================================================
     # Check GPU availability
     # ========================================================================
@@ -311,11 +408,11 @@ def main():
     print("="*60)
     
     # Source training data (Telemedicine)
-    df = pd.read_csv('../../datasets/telemedicine_preprocessed/train.csv')
+    df = pd.read_csv(CFG['source_labeled_csv'])
     # Target test data (Lazada)
-    target_test_df = pd.read_csv('../../datasets/lazada_test_preprocessed.csv')
+    target_test_df = pd.read_csv(CFG['target_eval_csv'])
     # Source test data (Telemedicine)
-    source_test_df = pd.read_csv('../../datasets/telemedicine_preprocessed/test.csv')
+    source_test_df = pd.read_csv(CFG['source_test_csv'])
     
     print(f"Dataset shape: {df.shape}")
     print(f"\nColumns: {df.columns.tolist()}")
@@ -344,21 +441,20 @@ def main():
     print("Loading domain-adapted model with adapter...")
     print("="*60)
     
-    model_path = "../../dapt_lazada"
+    model_path = CFG['dapt_model_dir']
     print(f"Loading domain-adapted model from: {model_path}")
     
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     
     model = DAPTAdapterClassifier(
         base_model_dir=model_path,
-        adapter_dim=16,
-        dropout=0.2,
+        adapter_dim=CFG['task_adapter_dim'],
+        dropout=CFG['dropout'],
         num_labels=2
     )
     
     # Unfreeze top N encoder layers for task-adaptive fine-tuning
-    UNFREEZE_TOP_LAYERS = 4
-    unfreeze_top_layers(model, UNFREEZE_TOP_LAYERS)
+    unfreeze_top_layers(model, CFG['unfreeze_top_layers'])
     
     print(f"Model loaded successfully!")
     print(f"Model type: {model.__class__.__name__}")
@@ -375,33 +471,26 @@ def main():
     print("Preparing data for training...")
     print("="*60)
     
-    dataset_dict = {
-        "text": df['text'].tolist(),
-        "label": df['label_id'].tolist()
-    }
-    dataset = Dataset.from_dict(dataset_dict)
+    # Stratified 85/15 train/val split — same as ADAPT-DANN (val_split=0.15)
+    train_df, val_df = train_test_split(
+        df, test_size=CFG['val_split'], random_state=CFG['seed'], stratify=df['label_id']
+    )
+    train_dataset = Dataset.from_dict({"text": train_df['text'].tolist(), "label": train_df['label_id'].tolist()})
+    test_dataset = Dataset.from_dict({"text": val_df['text'].tolist(), "label": val_df['label_id'].tolist()})
     
-    print(f"Dataset size: {len(dataset)}")
+    print(f"Dataset size: {len(df)}")
     
     def tokenize_function(examples):
         return tokenizer(
             examples["text"],
             truncation=True,
-            max_length=128,
+            max_length=CFG['max_length'],
             padding=False
         )
     
     print("\nTokenizing dataset...")
-    tokenized_dataset = dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=["text"],
-        desc="Tokenizing"
-    )
-    
-    train_test_split = tokenized_dataset.train_test_split(test_size=0.2, seed=42)
-    train_dataset = train_test_split['train']
-    test_dataset = train_test_split['test']
+    train_dataset = train_dataset.map(tokenize_function, batched=True, remove_columns=["text"], desc="Tokenizing train")
+    test_dataset = test_dataset.map(tokenize_function, batched=True, remove_columns=["text"], desc="Tokenizing val")
     
     print(f"\nTraining samples: {len(train_dataset)}")
     print(f"Test samples: {len(test_dataset)}")
@@ -415,47 +504,48 @@ def main():
     print("Configuring training parameters...")
     print("="*60)
     
-    ADAPTER_LR = 1e-5
-    CLASSIFIER_LR = 1e-3
-    ENCODER_LR = 5e-6  # Lower LR for unfrozen encoder layers
-    
+    # LRs come from CFG: learning_rate (encoder), task_adapter_lr, classifier_lr
     training_args = TrainingArguments(
-        output_dir="./models/dapt_lazada_adapter_source_finetuned",
-        num_train_epochs=3,
-        per_device_train_batch_size=32,
-        per_device_eval_batch_size=32,
-        learning_rate=ADAPTER_LR,  # Default LR (overridden by custom optimizer)
-        weight_decay=0.02,
-        warmup_ratio=0.1,
+        output_dir=CFG['output_dir'],
+        num_train_epochs=CFG['epochs_task'],
+        per_device_train_batch_size=CFG['batch_size'],
+        per_device_eval_batch_size=CFG['batch_size'],
+        learning_rate=CFG['learning_rate'],  # Default LR (overridden by custom optimizer)
+        weight_decay=CFG['weight_decay'],
+        warmup_ratio=CFG['warmup_ratio'],
         eval_strategy="epoch",
         save_strategy="epoch",
         load_best_model_at_end=True,
-        metric_for_best_model="f1",
-        greater_is_better=True,
-        logging_steps=50,
-        fp16=torch.cuda.is_available(),
+        # ADAPT-DANN keeps the epoch with the lowest validation loss
+        metric_for_best_model="loss",
+        greater_is_better=False,
+        max_grad_norm=CFG['max_grad_norm'],
+        logging_steps=CFG['logging_steps'],
+        disable_tqdm=not USE_VERBOSE,
+        fp16=False,  # ADAPT-DANN trains in fp32
         push_to_hub=False,
-        report_to="none"
+        report_to="none",
+        seed=CFG['seed'],
     )
     
-    # Separate learning rates: encoder < adapter < classifier
+    # Separate learning rates: encoder < adapter = classifier
     optimizer_grouped_parameters = [
-        {'params': [p for n, p in model.named_parameters() if 'encoder' in n and p.requires_grad], 'lr': ENCODER_LR},
-        {'params': [p for n, p in model.named_parameters() if 'adapter' in n and p.requires_grad], 'lr': ADAPTER_LR},
-        {'params': [p for n, p in model.named_parameters() if 'classifier' in n and p.requires_grad], 'lr': CLASSIFIER_LR},
+        {'params': [p for n, p in model.named_parameters() if 'encoder' in n and p.requires_grad], 'lr': CFG['learning_rate']},
+        {'params': [p for n, p in model.named_parameters() if 'adapter' in n and p.requires_grad], 'lr': CFG['task_adapter_lr']},
+        {'params': [p for n, p in model.named_parameters() if 'classifier' in n and p.requires_grad], 'lr': CFG['classifier_lr']},
     ]
-    optimizer = AdamW(optimizer_grouped_parameters, weight_decay=0.02)
+    optimizer = AdamW(optimizer_grouped_parameters, weight_decay=CFG['weight_decay'])
     
-    total_steps = len(train_dataset) // training_args.per_device_train_batch_size * training_args.num_train_epochs
-    warmup_steps = int(0.1 * total_steps)
+    total_steps = math.ceil(len(train_dataset) / training_args.per_device_train_batch_size) * int(training_args.num_train_epochs)
+    warmup_steps = int(CFG['warmup_ratio'] * total_steps)
     scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
     
     print("Training configuration:")
     print(f"  Epochs: {training_args.num_train_epochs}")
     print(f"  Batch size: {training_args.per_device_train_batch_size}")
-    print(f"  Encoder LR: {ENCODER_LR} (unfrozen top {UNFREEZE_TOP_LAYERS} layers)")
-    print(f"  Adapter LR: {ADAPTER_LR}")
-    print(f"  Classifier LR: {CLASSIFIER_LR}")
+    print(f"  Encoder LR: {CFG['learning_rate']} (unfrozen top {CFG['unfreeze_top_layers']} layers)")
+    print(f"  Task adapter LR: {CFG['task_adapter_lr']}")
+    print(f"  Classifier LR: {CFG['classifier_lr']}")
     print(f"  FP16: {training_args.fp16}")
     
     trainer = Trainer(
@@ -565,28 +655,8 @@ def main():
     )
     
     # ========================================================================
-    # Final Summary
+    # Final Summary — printed at the very end of main()
     # ========================================================================
-    print("\n" + "="*60)
-    print("FINAL SUMMARY - DAPT + Adapter on Source (Adapter-only)")
-    print("="*60)
-    print(f"\nPipeline: MLM on target -> Fine-tune DAPT + Adapter on SOURCE (frozen encoder) -> Evaluate")
-    print(f"\n{'Metric':<12} {'Source':<15} {'Target':<15} {'Gap':<10}")
-    print("-"*52)
-    for metric in ['accuracy', 'precision', 'recall', 'f1']:
-        src_val = source_results[metric]
-        tgt_val = target_results[metric]
-        gap = src_val - tgt_val
-        print(f"{metric.capitalize():<12} {src_val:<15.4f} {tgt_val:<15.4f} {gap:<+10.4f}")
-    
-    print(f"\n{'Samples':<12} {source_results['samples']:<15} {target_results['samples']:<15}")
-    
-    print("\n" + "="*60)
-    print("Comparison:")
-    print("="*60)
-    print("DAPT Source Only (full FT on target):        Source ~86.13%  Target ~82.94%  Gap ~3.19%")
-    print("DAPT + Adapter Full FT on target:            Source ~90.80%  Target ~85.50%  Gap ~5.30%")
-    print("DAPT + Adapter on Source (this, adapter-only): Source  ?.??%  Target  ?.??%  Gap  ?.??%")
     
     # ========================================================================
     # t-SNE Visualization
@@ -611,6 +681,17 @@ def main():
     print("\n" + "="*60)
     print("All done!")
     print("="*60)
+
+    # Compact summary — always printed (this is the only output in quiet mode)
+    print_summary(
+        f"Model: DAPT + Adapter on source, adapter-only ({model_path})",
+        f"batch={CFG['batch_size']}  max_len={CFG['max_length']}  epochs={CFG['epochs_task']}  "
+        f"lr_enc={CFG['learning_rate']:g}  lr_task_adapter={CFG['task_adapter_lr']:g}  lr_head={CFG['classifier_lr']:g}  "
+        f"wd={CFG['weight_decay']}  val_split={CFG['val_split']}  "
+        f"seed={CFG['seed']}",
+        source_results,
+        target_results,
+    )
 
 
 if __name__ == "__main__":
