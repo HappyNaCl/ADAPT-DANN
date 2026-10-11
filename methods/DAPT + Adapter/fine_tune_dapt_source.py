@@ -1,614 +1,324 @@
 """
-Fine-tune DAPT Model on Source Dataset (No Adapter - DAPT Only Baseline)
+DAPT-only baseline (no adapter).
 
-This script loads the DAPT (Domain Adaptive Pretrained) model and fine-tunes
-ONLY the classifier head for sentiment classification on SOURCE domain
-(Telemedicine) data, then evaluates on both source and target test sets.
+Loads the DAPT backbone (IndoBERT further pretrained on Lazada reviews), freezes it,
+and trains only a small classifier head on the labelled Telemedicine reviews (source).
+The trained model is then tested on Telemedicine (source) and Lazada (target).
 
-Purpose:
-  Baseline to measure the contribution of the adapter layer.
-  Comparing DAPT+Adapter vs DAPT-only shows how much the adapter helps.
+Comparing this with DAPT + Adapter shows how much the adapter adds.
 
-Pipeline:
-  1. bert_mlm_target.py  -> MLM pretraining on target -> DAPT model
-  2. This script          -> Fine-tune DAPT on SOURCE labeled data (classifier-only)
-  3. Evaluate on source + target test sets
+Usage (from methods/DAPT + Adapter):
+    python3 fine_tune_dapt_source.py --seed 42
+    python3 fine_tune_dapt_source.py --seed 42 --head_lr 5e-4 --epochs 5
+    python3 fine_tune_dapt_source.py --help      # every CFG key can be set this way
 """
 
 import argparse
+import json
 import os
 import sys
+from pathlib import Path
 
+import datasets
+import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import numpy as np
+import transformers
+from datasets import Dataset
+from sklearn.metrics import accuracy_score, classification_report, precision_recall_fscore_support
 from torch.optim import AdamW
+from torch.utils.data import DataLoader
 from transformers import (
-    AutoTokenizer,
     AutoModel,
+    AutoTokenizer,
+    DataCollatorWithPadding,
     Trainer,
     TrainingArguments,
-    DataCollatorWithPadding,
     get_cosine_schedule_with_warmup,
+    set_seed,
 )
-from datasets import Dataset
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
+
+_HERE = Path(__file__).resolve().parent
+_DATA = _HERE / '..' / '..' / 'datasets'
+
+CFG = {
+    # Paths
+    'dapt_model_dir':     str(_HERE / '..' / '..' / 'dapt_lazada'),
+    'source_labeled_csv': str(_DATA / 'telemedicine_preprocessed' / 'train.csv'),
+    'source_test_csv':    str(_DATA / 'telemedicine_preprocessed' / 'test.csv'),
+    'target_eval_csv':    str(_DATA / 'lazada_test_preprocessed.csv'),
+    'output_dir':         str(_HERE / 'models' / 'dapt_lazada_source_finetuned'),  # checkpoints
+    'final_model_dir':    str(_HERE / 'models' / 'dapt_lazada_source_final'),
+    'tsne_path':          str(_HERE / 'outputs' / 'tsne_dapt_source_vs_lazada.png'),
+
+    # Training (same values as the other methods)
+    'batch_size':    32,
+    'max_length':    128,
+    'epochs':        3,
+    'head_lr':       1e-3,   # only the classifier head trains; the encoder is frozen
+    'weight_decay':  0.02,
+    'warmup_ratio':  0.1,
+    'dropout':       0.2,
+    'val_split':     0.2,    # part of the source training data held out for picking the best epoch
+    'logging_steps': 50,
+    'seed':          42,
+}
+
+LABELS = ['negative', 'positive']
+LABEL2ID = {name: i for i, name in enumerate(LABELS)}
+
+# In quiet mode stdout is muted, so the summary is written here instead.
+REAL_STDOUT = sys.stdout
 
 
-# ---------- Verbose control ---------------------------------------------------
-# Default: only the compact 2-line header + 4-line summary is printed.
-# Pass --use-verbose to see the full training logs.
-_ORIG_STDOUT = sys.stdout
-USE_VERBOSE = False
-
-
-def set_verbose(verbose: bool):
-    """Silence stdout + library logs/progress bars unless verbose is set."""
-    global USE_VERBOSE
-    USE_VERBOSE = bool(verbose)
-    if USE_VERBOSE:
-        return
-    sys.stdout = open(os.devnull, 'w')
-    try:
-        from transformers.utils.logging import set_verbosity_error
-        set_verbosity_error()
-    except Exception:
-        pass
-    try:
-        from datasets.utils import disable_progress_bars
-        disable_progress_bars()
-    except Exception:
-        pass
-
-
-def print_summary(model_line: str, hparams_line: str, src: dict, tgt: dict):
-    """Compact summary — always printed, even in quiet mode."""
-    out = _ORIG_STDOUT
-    print(model_line, file=out)
-    print(hparams_line, file=out)
-    for key in ('accuracy', 'precision', 'recall', 'f1'):
-        s, t = src.get(key), tgt.get(key)
-        if s is None or t is None:
-            continue
-        print(f'{key}: source={s:.4f}  target={t:.4f}  gap={s - t:+.4f}', file=out)
-    out.flush()
-
-
-def parse_args():
+# ---------- Setup -------------------------------------------------------------
+def load_config():
+    """Return CFG with any command-line overrides, plus the verbose flag."""
     parser = argparse.ArgumentParser(
-        description='Fine-tune DAPT model (no adapter) on SOURCE data.'
+        description='DAPT-only baseline: train a classifier head on source data.',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--use-verbose', dest='use_verbose', action='store_true',
-                        help='Show all training logs (default: summary only)')
-    return parser.parse_args()
+    parser.add_argument('--use-verbose', '--use_verbose', dest='use_verbose', action='store_true',
+                        help='show the full training log instead of just the summary')
+    for key, default in CFG.items():
+        parser.add_argument(f'--{key}', type=type(default), default=default)
+    args = parser.parse_args()
+    return {key: getattr(args, key) for key in CFG}, args.use_verbose
 
 
-def compute_metrics(eval_pred):
-    """Calculate evaluation metrics"""
-    predictions, labels = eval_pred
-    predictions = np.argmax(predictions, axis=1)
-    
-    accuracy = accuracy_score(labels, predictions)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        labels, predictions, average='weighted'
-    )
-    
-    return {
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1
-    }
+def mute_output():
+    """Hide prints, library logs and progress bars (used when not verbose)."""
+    sys.stdout = open(os.devnull, 'w')
+    transformers.logging.set_verbosity_error()
+    datasets.disable_progress_bars()
 
 
-def evaluate_on_test_set(trainer, tokenizer, test_df, text_column, label2id, id2label, 
-                         domain_name, tokenize_function):
-    """Evaluate the trained model on a given test set and print detailed metrics."""
-    print("\n" + "="*60)
-    print(f"Evaluating on {domain_name} test set...")
-    print("="*60)
-    
-    print(f"\nTest set shape: {test_df.shape}")
-    print(f"Label distribution:")
-    print(test_df['label'].value_counts())
-    
-    test_df = test_df.copy()
-    test_df['label_id'] = test_df['label'].map(label2id)
-    
-    test_dict = {
-        "text": test_df[text_column].tolist(),
-        "label": test_df['label_id'].tolist()
-    }
-    test_dataset = Dataset.from_dict(test_dict)
-    
-    print(f"\nTokenizing {domain_name} test data...")
-    test_tokenized = test_dataset.map(
-        tokenize_function,
+# ---------- Data --------------------------------------------------------------
+def read_labeled_csv(path):
+    df = pd.read_csv(path)
+    df['label'] = df['label'].astype(str).str.strip().str.lower()
+    return df
+
+
+def to_dataset(df, tokenizer, max_length):
+    """Turn a dataframe with 'text' and 'label' columns into a tokenized Dataset."""
+    dataset = Dataset.from_dict({
+        'text': df['text'].tolist(),
+        'label': df['label'].map(LABEL2ID).tolist(),
+    })
+    return dataset.map(
+        lambda batch: tokenizer(batch['text'], truncation=True, max_length=max_length),
         batched=True,
-        remove_columns=["text"],
-        desc=f"Tokenizing {domain_name} test"
+        remove_columns=['text'],
     )
-    
-    print(f"\nMaking predictions on {domain_name} test set...")
-    predictions = trainer.predict(test_tokenized)
-    pred_labels = np.argmax(predictions.predictions, axis=1)
-    true_labels = predictions.label_ids
-    
-    accuracy = accuracy_score(true_labels, pred_labels)
-    precision, recall, f1, _ = precision_recall_fscore_support(
-        true_labels, pred_labels, average='weighted'
-    )
-    
-    print(f"\n{domain_name.upper()} TEST SET RESULTS:")
-    print(f"  Samples:   {len(test_df)}")
-    print(f"  Accuracy:  {accuracy:.4f} ({accuracy*100:.2f}%)")
-    print(f"  Precision: {precision:.4f}")
-    print(f"  Recall:    {recall:.4f}")
-    print(f"  F1 Score:  {f1:.4f}")
-    
-    print(f"\nDetailed Classification Report ({domain_name}):")
-    print("-"*60)
-    print(classification_report(
-        true_labels,
-        pred_labels,
-        target_names=['negative', 'positive'],
-        digits=4
-    ))
-    
-    return {
-        'domain': domain_name,
-        'accuracy': accuracy,
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
-        'samples': len(test_df)
-    }
 
 
-def run_tsne_visualization(model, tokenizer, source_test_df, target_test_df, 
-                           text_column, label2id, tokenize_function, 
-                           output_path, device, title):
-    """Extract embeddings and run t-SNE visualization"""
-    try:
-        from sklearn.manifold import TSNE
-        from sklearn.decomposition import PCA
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        import seaborn as sns
-        from torch.utils.data import DataLoader
-        
-        sns.set(style="whitegrid")
-        
-        PALETTE = {
-            ('source', 0): '#d62728',
-            ('source', 1): '#1f77b4',
-            ('target', 0): '#2ca02c',
-            ('target', 1): '#9467bd',
-        }
-        DISPLAY_NAMES = {
-            ('source', 0): 'source negative',
-            ('source', 1): 'source positive',
-            ('target', 0): 'target negative',
-            ('target', 1): 'target positive',
-        }
-        PLOT_ORDER = [('source', 0), ('source', 1), ('target', 0), ('target', 1)]
-        
-        def extract_embeddings(model, dataloader, device):
-            model.eval()
-            Xs, Ys = [], []
-            with torch.no_grad():
-                for batch in dataloader:
-                    input_ids = batch['input_ids'].to(device)
-                    attention_mask = batch['attention_mask'].to(device)
-                    
-                    feat = model.dropout(model.mean_pool(input_ids, attention_mask))
-                    Xs.append(feat.cpu().numpy())
-                    
-                    labels = batch.get('labels')
-                    if isinstance(labels, torch.Tensor):
-                        Ys.append(labels.cpu().numpy())
-                    elif labels is not None:
-                        Ys.append(np.array(labels))
-                    else:
-                        Ys.append(np.full((feat.size(0),), -1, dtype=int))
-            return np.concatenate(Xs, 0), np.concatenate(Ys, 0)
-        
-        # Tokenize test sets
-        source_dict = {
-            "text": source_test_df[text_column].tolist(),
-            "label": source_test_df['label'].map(label2id).tolist()
-        }
-        target_dict = {
-            "text": target_test_df[text_column].tolist(),
-            "label": target_test_df['label'].map(label2id).tolist()
-        }
-        
-        source_dataset = Dataset.from_dict(source_dict)
-        target_dataset = Dataset.from_dict(target_dict)
-        
-        source_tokenized = source_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
-        target_tokenized = target_dataset.map(tokenize_function, batched=True, remove_columns=["text"])
-        
-        data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-        source_loader = DataLoader(source_tokenized, batch_size=32, shuffle=False, collate_fn=data_collator)
-        target_loader = DataLoader(target_tokenized, batch_size=32, shuffle=False, collate_fn=data_collator)
-        
-        print("  Extracting source embeddings...")
-        Xs_src, Ys_src = extract_embeddings(model, source_loader, device)
-        print("  Extracting target embeddings...")
-        Xs_tgt, Ys_tgt = extract_embeddings(model, target_loader, device)
-        
-        X = np.concatenate([Xs_src, Xs_tgt], axis=0)
-        Y = np.concatenate([Ys_src, Ys_tgt], axis=0)
-        domains = np.array(['source'] * Xs_src.shape[0] + ['target'] * Xs_tgt.shape[0])
-        
-        print("  Running t-SNE...")
-        if X.shape[1] > 50:
-            X = PCA(n_components=50, random_state=42).fit_transform(X)
-        tsne = TSNE(n_components=2, random_state=42, init='pca', perplexity=30)
-        proj = tsne.fit_transform(X)
-        
-        # Plot
-        fig, ax = plt.subplots(1, 1, figsize=(7, 6))
-        xs, ys = proj[:, 0], proj[:, 1]
-        
-        for dom, lab in PLOT_ORDER:
-            mask = (domains == dom) & (Y == lab)
-            if mask.sum() == 0:
-                continue
-            ax.scatter(xs[mask], ys[mask], s=10, alpha=0.8, 
-                      c=PALETTE[(dom, lab)], label=DISPLAY_NAMES[(dom, lab)])
-        
-        ax.set_title(title, fontsize=24)
-        ax.grid(False)
-        ax.legend(loc='best', fontsize=18, frameon=True, markerscale=2)
-        fig.tight_layout()
-        
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        fig.savefig(output_path, dpi=200)
-        plt.close(fig)
-        print(f"  Saved t-SNE visualization to: {output_path}")
-        
-    except Exception as e:
-        print(f"  t-SNE visualization failed: {e}")
-
-
+# ---------- Model -------------------------------------------------------------
 class DAPTClassifier(nn.Module):
-    """DAPT model with classifier head only (NO adapter)"""
-    def __init__(self, base_model_dir, dropout=0.2, num_labels=2):
+    """Frozen DAPT encoder -> average of token vectors -> small classifier head."""
+
+    def __init__(self, model_dir, dropout):
         super().__init__()
-        self.encoder = AutoModel.from_pretrained(base_model_dir)
-        hidden_size = self.encoder.config.hidden_size
-        self.dropout = nn.Dropout(dropout)
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_size // 2, num_labels),
-        )
-        # FREEZE encoder - only classifier trainable
+        self.encoder = AutoModel.from_pretrained(model_dir)
         for p in self.encoder.parameters():
             p.requires_grad = False
-        
-        self.config = self.encoder.config
-        self.config.problem_type = "single_label_classification"
-        self.config.num_labels = num_labels
 
-    def mean_pool(self, input_ids, attention_mask):
-        outputs = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        hidden = outputs.last_hidden_state
+        hidden = self.encoder.config.hidden_size
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden, hidden // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden // 2, len(LABELS)),
+        )
+
+    def embed(self, input_ids, attention_mask):
+        """One vector per review: the mean of its token vectors, ignoring padding."""
+        hidden = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         mask = attention_mask.unsqueeze(-1).float()
         return (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
-        feat = self.dropout(self.mean_pool(input_ids, attention_mask))
-        logits = self.classifier(feat)
-        loss = None
-        if labels is not None:
-            loss = nn.CrossEntropyLoss()(logits, labels)
-        return {'loss': loss, 'logits': logits} if loss is not None else {'logits': logits}
+        logits = self.classifier(self.dropout(self.embed(input_ids, attention_mask)))
+        if labels is None:
+            return {'logits': logits}
+        return {'loss': nn.functional.cross_entropy(logits, labels), 'logits': logits}
 
 
+# ---------- Evaluation --------------------------------------------------------
+def scores(labels, preds):
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, preds, average='weighted')
+    return {'accuracy': accuracy_score(labels, preds), 'precision': precision, 'recall': recall, 'f1': f1}
+
+
+def compute_metrics(eval_pred):
+    """Used by the Trainer on the validation split after each epoch."""
+    logits, labels = eval_pred
+    return scores(labels, np.argmax(logits, axis=1))
+
+
+def evaluate(trainer, dataset, name):
+    """Predict on a test set, print a per-class report and return the scores."""
+    output = trainer.predict(dataset)
+    preds = np.argmax(output.predictions, axis=1)
+    print(f'\n{name} test set ({len(dataset)} reviews)')
+    print(classification_report(output.label_ids, preds, target_names=LABELS, digits=4))
+    return scores(output.label_ids, preds)
+
+
+def print_summary(cfg, source, target):
+    """The short result block, shown even in quiet mode.
+    run_dapt_source_seeds.sh greps these lines, so keep the format."""
+    lines = [
+        f"Model: DAPT-only, no adapter ({Path(cfg['dapt_model_dir']).name})",
+        f"batch={cfg['batch_size']}  max_len={cfg['max_length']}  epochs={cfg['epochs']}  "
+        f"lr_heads={cfg['head_lr']:g}  wd={cfg['weight_decay']}  "
+        f"val_split={cfg['val_split']}  seed={cfg['seed']}",
+    ]
+    for key in ['accuracy', 'precision', 'recall', 'f1']:
+        s, t = source[key], target[key]
+        lines.append(f'{key}: source={s:.4f}  target={t:.4f}  gap={s - t:+.4f}')
+    print('\n'.join(lines), file=REAL_STDOUT, flush=True)
+
+
+def plot_tsne(model, tokenizer, source_test, target_test, path, device, title='DAPT'):
+    """Squash the source and target test embeddings to 2D and save a scatter plot."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from sklearn.decomposition import PCA
+    from sklearn.manifold import TSNE
+
+    @torch.no_grad()
+    def embed_all(dataset):
+        loader = DataLoader(dataset, batch_size=32, collate_fn=DataCollatorWithPadding(tokenizer))
+        vectors, labels = [], []
+        for batch in loader:
+            vectors.append(model.embed(batch['input_ids'].to(device),
+                                       batch['attention_mask'].to(device)).cpu().numpy())
+            labels.append(batch['labels'].numpy())
+        return np.concatenate(vectors), np.concatenate(labels)
+
+    model.eval()
+    src_x, src_y = embed_all(source_test)
+    tgt_x, tgt_y = embed_all(target_test)
+    x = np.concatenate([src_x, tgt_x])
+    y = np.concatenate([src_y, tgt_y])
+    domain = np.array(['source'] * len(src_x) + ['target'] * len(tgt_x))
+
+    if x.shape[1] > 50:  # PCA first makes t-SNE faster and less noisy
+        x = PCA(n_components=50, random_state=42).fit_transform(x)
+    points = TSNE(n_components=2, random_state=42, init='pca', perplexity=30).fit_transform(x)
+
+    colors = {
+        ('source', 0): '#d62728', ('source', 1): '#1f77b4',
+        ('target', 0): '#2ca02c', ('target', 1): '#9467bd',
+    }
+    sns.set(style='whitegrid')
+    fig, ax = plt.subplots(figsize=(7, 6))
+    for (dom, label), color in colors.items():
+        mask = (domain == dom) & (y == label)
+        if mask.any():
+            ax.scatter(points[mask, 0], points[mask, 1], s=10, alpha=0.8, c=color,
+                       label=f'{dom} {LABELS[label]}')
+    ax.set_title(title, fontsize=24)
+    ax.grid(False)
+    ax.legend(loc='best', fontsize=18, frameon=True, markerscale=2)
+    fig.tight_layout()
+
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=200)
+    plt.close(fig)
+
+
+# ---------- Main --------------------------------------------------------------
 def main():
-    args = parse_args()
-    set_verbose(args.use_verbose)
+    cfg, verbose = load_config()
+    if not verbose:
+        mute_output()
+    set_seed(cfg['seed'])
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print('Device:', device)
+    print('Config:', json.dumps(cfg, indent=2))
 
-    # ========================================================================
-    # Check GPU availability
-    # ========================================================================
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    
-    # ========================================================================
-    # Load Source Dataset (for fine-tuning)
-    # ========================================================================
-    print("\n" + "="*60)
-    print("Loading SOURCE dataset for fine-tuning...")
-    print("="*60)
-    
-    # Source training data (Telemedicine)
-    df = pd.read_csv('../../datasets/telemedicine_preprocessed/train.csv')
-    # Target test data (Lazada)
-    target_test_df = pd.read_csv('../../datasets/lazada_test_preprocessed.csv')
-    # Source test data (Telemedicine)
-    source_test_df = pd.read_csv('../../datasets/telemedicine_preprocessed/test.csv')
-    
-    print(f"Dataset shape: {df.shape}")
-    print(f"\nColumns: {df.columns.tolist()}")
-    print(f"\nLabel distribution:")
-    print(df['label'].value_counts())
-    
-    label2id = {'negative': 0, 'positive': 1}
-    id2label = {0: 'negative', 1: 'positive'}
-    
-    df['label'] = df['label'].astype(str).str.strip().str.lower()
-    target_test_df['label'] = target_test_df['label'].astype(str).str.strip().str.lower()
-    source_test_df['label'] = source_test_df['label'].astype(str).str.strip().str.lower()
-    
-    df['label_id'] = df['label'].map(label2id)
-    
-    print("\nLabel mapping:")
-    print(f"  negative -> 0")
-    print(f"  positive -> 1")
-    print(f"\nLabel distribution (numeric):")
-    print(df['label_id'].value_counts().sort_index())
-    
-    # ========================================================================
-    # Load DAPT Model (No Adapter)
-    # ========================================================================
-    print("\n" + "="*60)
-    print("Loading DAPT model (no adapter)...")
-    print("="*60)
-    
-    model_path = "../../dapt_lazada"
-    print(f"Loading domain-adapted model from: {model_path}")
-    
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
-    
-    model = DAPTClassifier(
-        base_model_dir=model_path,
-        dropout=0.2,
-        num_labels=2
-    ).to(device)
-    
-    print(f"Model loaded successfully!")
-    print(f"Model type: {model.__class__.__name__}")
-    print(f"Number of labels: {model.config.num_labels}")
-    
+    # Data
+    train_df = read_labeled_csv(cfg['source_labeled_csv'])
+    source_test_df = read_labeled_csv(cfg['source_test_csv'])
+    target_test_df = read_labeled_csv(cfg['target_eval_csv'])
+    print('Source training labels:', train_df['label'].value_counts().to_dict())
+
+    # Model
+    tokenizer = AutoTokenizer.from_pretrained(cfg['dapt_model_dir'])
+    model = DAPTClassifier(cfg['dapt_model_dir'], cfg['dropout']).to(device)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
-    
-    # ========================================================================
-    # Prepare Data for Training
-    # ========================================================================
-    print("\n" + "="*60)
-    print("Preparing data for training...")
-    print("="*60)
-    
-    dataset_dict = {
-        "text": df['text'].tolist(),
-        "label": df['label_id'].tolist()
-    }
-    dataset = Dataset.from_dict(dataset_dict)
-    
-    print(f"Dataset size: {len(dataset)}")
-    
-    def tokenize_function(examples):
-        return tokenizer(
-            examples["text"],
-            truncation=True,
-            max_length=128,
-            padding=False
-        )
-    
-    print("\nTokenizing dataset...")
-    tokenized_dataset = dataset.map(
-        tokenize_function,
-        batched=True,
-        remove_columns=["text"],
-        desc="Tokenizing"
-    )
-    
-    train_test_split = tokenized_dataset.train_test_split(test_size=0.2, seed=args.seed)
-    train_dataset = train_test_split['train']
-    test_dataset = train_test_split['test']
-    
-    print(f"\nTraining samples: {len(train_dataset)}")
-    print(f"Test samples: {len(test_dataset)}")
-    
-    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    
-    # ========================================================================
-    # Configure Training Parameters
-    # ========================================================================
-    print("\n" + "="*60)
-    print("Configuring training parameters...")
-    print("="*60)
-    
-    CLASSIFIER_LR = 1e-3
-    
+    print(f'Trainable params: {trainable:,} of {total:,}')
+
+    # Tokenize, and hold out part of the source training data for validation
+    split = to_dataset(train_df, tokenizer, cfg['max_length']).train_test_split(
+        test_size=cfg['val_split'], seed=cfg['seed'])
+    train_set, val_set = split['train'], split['test']
+    source_test = to_dataset(source_test_df, tokenizer, cfg['max_length'])
+    target_test = to_dataset(target_test_df, tokenizer, cfg['max_length'])
+    print(f'Train {len(train_set)} | val {len(val_set)} | '
+          f'source test {len(source_test)} | target test {len(target_test)}')
+
+    # We give the Trainer our own optimizer and schedule, so learning-rate
+    # settings inside TrainingArguments would be ignored.
+    optimizer = AdamW(model.classifier.parameters(), lr=cfg['head_lr'], weight_decay=cfg['weight_decay'])
+    total_steps = len(train_set) // cfg['batch_size'] * cfg['epochs']
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, num_warmup_steps=int(cfg['warmup_ratio'] * total_steps), num_training_steps=total_steps)
+
     training_args = TrainingArguments(
-        output_dir="../../dapt_lazada/",
-        num_train_epochs=3,
-        per_device_train_batch_size=32,
-        per_device_eval_batch_size=32,
-        learning_rate=1e-5,
-        weight_decay=0.02,
-        warmup_ratio=0.1,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        load_best_model_at_end=True,
-        metric_for_best_model="f1",
+        output_dir=cfg['output_dir'],
+        num_train_epochs=cfg['epochs'],
+        per_device_train_batch_size=cfg['batch_size'],
+        per_device_eval_batch_size=cfg['batch_size'],
+        eval_strategy='epoch',
+        save_strategy='epoch',
+        save_total_limit=1,             # each checkpoint is ~440 MB
+        load_best_model_at_end=True,    # keep the epoch with the best validation F1
+        metric_for_best_model='f1',
         greater_is_better=True,
-        logging_steps=50,
-        disable_tqdm=not USE_VERBOSE,
+        logging_steps=cfg['logging_steps'],
+        disable_tqdm=not verbose,
         fp16=torch.cuda.is_available(),
-        push_to_hub=False,
-        report_to="none",
-        seed=args.seed,
+        report_to='none',
+        seed=cfg['seed'],
     )
-    
-    # Custom optimizer with classifier LR
-    optimizer_grouped_parameters = [
-        {'params': [p for n, p in model.named_parameters() if 'classifier' in n and p.requires_grad], 'lr': CLASSIFIER_LR},
-    ]
-    optimizer = AdamW(optimizer_grouped_parameters, weight_decay=0.02)
-    
-    total_steps = len(train_dataset) // training_args.per_device_train_batch_size * training_args.num_train_epochs
-    warmup_steps = int(0.1 * total_steps)
-    scheduler = get_cosine_schedule_with_warmup(optimizer, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
-    
-    print("Training configuration:")
-    print(f"  Epochs: {training_args.num_train_epochs}")
-    print(f"  Batch size: {training_args.per_device_train_batch_size}")
-    print(f"  Classifier LR: {CLASSIFIER_LR}")
-    print(f"  FP16: {training_args.fp16}")
-    print(f"  No adapter - classifier head only")
-    
     trainer = Trainer(
         model=model,
         args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=test_dataset,
-        data_collator=data_collator,
+        train_dataset=train_set,
+        eval_dataset=val_set,
+        data_collator=DataCollatorWithPadding(tokenizer),
         compute_metrics=compute_metrics,
         optimizers=(optimizer, scheduler),
     )
-    
-    print("\nTrainer initialized successfully!")
-    
-    # ========================================================================
-    # Train the Model
-    # ========================================================================
-    print("\n" + "="*60)
-    print("Starting fine-tuning on SOURCE domain data (classifier-only)...")
-    print("="*60)
-    
-    train_result = trainer.train()
-    
-    print("\n" + "="*60)
-    print("Training completed!")
-    print(f"Training loss: {train_result.training_loss:.4f}")
-    print(f"Training time: {train_result.metrics['train_runtime']:.2f} seconds")
-    
-    # ========================================================================
-    # Evaluate on internal validation split
-    # ========================================================================
-    print("\n" + "="*60)
-    print("Evaluating model on internal validation split...")
-    print("="*60)
-    
-    eval_results = trainer.evaluate()
-    
-    print("\nInternal Validation Results:")
-    print(f"  Accuracy:  {eval_results['eval_accuracy']:.4f}")
-    print(f"  Precision: {eval_results['eval_precision']:.4f}")
-    print(f"  Recall:    {eval_results['eval_recall']:.4f}")
-    print(f"  F1 Score:  {eval_results['eval_f1']:.4f}")
-    print(f"  Loss:      {eval_results['eval_loss']:.4f}")
-    
-    predictions = trainer.predict(test_dataset)
-    pred_labels = np.argmax(predictions.predictions, axis=1)
-    true_labels = predictions.label_ids
-    
-    print("\nDetailed Classification Report (internal val):")
-    print("="*60)
-    print(classification_report(
-        true_labels, 
-        pred_labels, 
-        target_names=['negative', 'positive'],
-        digits=4
-    ))
-    
-    # ========================================================================
-    # Save the Fine-tuned Model
-    # ========================================================================
-    print("\n" + "="*60)
-    print("Saving the fine-tuned model...")
-    print("="*60)
-    
-    output_dir = "./models/dapt_lazada_source_final"
-    print(f"Saving model to {output_dir}...")
-    trainer.save_model(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    
-    if os.path.exists(output_dir):
-        files = os.listdir(output_dir)
-        print(f"\nSaved files in {output_dir}:")
-        for file in files:
-            file_path = os.path.join(output_dir, file)
-            if os.path.isfile(file_path):
-                size_mb = os.path.getsize(file_path) / (1024 * 1024)
-                print(f"  - {file:30s} ({size_mb:.2f} MB)")
-    
-    print(f"\n[OK] Model and tokenizer saved successfully to: {output_dir}")
-    
-    # ========================================================================
-    # Evaluate on SOURCE test set
-    # ========================================================================
-    source_results = evaluate_on_test_set(
-        trainer=trainer,
-        tokenizer=tokenizer,
-        test_df=source_test_df,
-        text_column='text',
-        label2id=label2id,
-        id2label=id2label,
-        domain_name='source',
-        tokenize_function=tokenize_function
-    )
-    
-    # ========================================================================
-    # Evaluate on TARGET test set
-    # ========================================================================
-    target_results = evaluate_on_test_set(
-        trainer=trainer,
-        tokenizer=tokenizer,
-        test_df=target_test_df,
-        text_column='text',
-        label2id=label2id,
-        id2label=id2label,
-        domain_name='target',
-        tokenize_function=tokenize_function
-    )
-    
-    # ========================================================================
-    # t-SNE Visualization
-    # ========================================================================
-    print("\n" + "="*60)
-    print("Generating t-SNE visualization...")
-    print("="*60)
-    
-    run_tsne_visualization(
-        model=model,
-        tokenizer=tokenizer,
-        source_test_df=source_test_df,
-        target_test_df=target_test_df,
-        text_column='text',
-        label2id=label2id,
-        tokenize_function=tokenize_function,
-        output_path="./outputs/tsne_dapt_source_vs_lazada.png",
-        device=device,
-        title="DAPT"
-    )
-    
-    print("\n" + "="*60)
-    print("All done!")
-    print("="*60)
 
-    # Compact summary — always printed (this is the only output in quiet mode)
-    print_summary(
-        f"Model: DAPT-only, no adapter ({model_path})",
-        f"batch=32  max_len=128  epochs={int(training_args.num_train_epochs)}  "
-        f"lr={training_args.learning_rate:g}  wd={training_args.weight_decay}  "
-        f"seed={args.seed}",
-        source_results,
-        target_results,
-    )
+    # Train
+    trainer.train()
+    print('Validation:', trainer.evaluate())
+    trainer.save_model(cfg['final_model_dir'])
+    tokenizer.save_pretrained(cfg['final_model_dir'])
+    print('Saved model to', cfg['final_model_dir'])
+
+    # Test
+    source_scores = evaluate(trainer, source_test, 'Source (Telemedicine)')
+    target_scores = evaluate(trainer, target_test, 'Target (Lazada)')
+
+    # The plot is a nice extra; don't lose the results if it fails
+    try:
+        plot_tsne(model, tokenizer, source_test, target_test, cfg['tsne_path'], device)
+        print('Saved t-SNE plot to', cfg['tsne_path'])
+    except Exception as e:
+        print(f'Warning: t-SNE plot failed: {e}', file=sys.stderr)
+
+    print_summary(cfg, source_scores, target_scores)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

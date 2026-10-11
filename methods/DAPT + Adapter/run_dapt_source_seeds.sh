@@ -7,6 +7,7 @@
 #   ./run_dapt_source_seeds.sh                 # quiet: summary only
 #   ./run_dapt_source_seeds.sh --use-verbose   # full training logs
 #   SEEDS="42 84" ./run_dapt_source_seeds.sh   # subset of seeds
+#   ./run_dapt_source_seeds.sh --head_lr 5e-4 --epochs 5   # any CFG key in the .py is a --flag
 #
 # Logs: outputs/seed_logs/seed_<N>.log
 # All summaries collected in outputs/seed_logs/summary_all.txt
