@@ -37,7 +37,6 @@ from transformers import (
     set_seed,
 )
 from datasets import Dataset
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, classification_report
 
 
@@ -85,10 +84,12 @@ def print_summary(model_line: str, hparams_line: str, src: dict, tgt: dict):
 # (dapt_model_dir); only a single task adapter + classifier head is trained.
 CFG = {
 'dapt_model_dir':           '../../dapt_lazada',
-'source_labeled_csv':       '../../datasets/telemedicine_preprocessed/train.csv',
+'source_labeled_csv':       '../../datasets/telemedicine_preprocessed/train_split.csv',
+'source_val_csv':           '../../datasets/telemedicine_preprocessed/val.csv',  # shared by all methods
 'source_test_csv':          '../../datasets/telemedicine_preprocessed/test.csv',
 'target_eval_csv':          '../../datasets/lazada_test_preprocessed.csv',
 'output_dir':               './models/dapt_lazada_adapter_source_finetuned',
+'final_model_dir':          './models/dapt_lazada_adapter_source_final',
 
 'batch_size':               32,
 'max_length':               128,
@@ -102,7 +103,6 @@ CFG = {
 'task_adapter_dim':         16,
 'max_grad_norm':            1.0,
 'unfreeze_top_layers':      4,
-'val_split':                0.15,
 'logging_steps':            50,
 'seed':                     42,
 }
@@ -471,10 +471,10 @@ def main():
     print("Preparing data for training...")
     print("="*60)
     
-    # Stratified 85/15 train/val split — same as ADAPT-DANN (val_split=0.15)
-    train_df, val_df = train_test_split(
-        df, test_size=CFG['val_split'], random_state=CFG['seed'], stratify=df['label_id']
-    )
+    # Fixed validation set (val.csv), shared by all methods; df is already train_split.csv
+    train_df = df
+    val_df = pd.read_csv(CFG['source_val_csv'])
+    val_df['label_id'] = val_df['label'].astype(str).str.strip().str.lower().map(label2id)
     train_dataset = Dataset.from_dict({"text": train_df['text'].tolist(), "label": train_df['label_id'].tolist()})
     test_dataset = Dataset.from_dict({"text": val_df['text'].tolist(), "label": val_df['label_id'].tolist()})
     
@@ -610,7 +610,7 @@ def main():
     print("Saving the fine-tuned model...")
     print("="*60)
     
-    output_dir = "./models/dapt_lazada_adapter_source_final"
+    output_dir = CFG['final_model_dir']
     print(f"Saving model to {output_dir}...")
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
@@ -687,7 +687,7 @@ def main():
         f"Model: DAPT + Adapter on source, adapter-only ({model_path})",
         f"batch={CFG['batch_size']}  max_len={CFG['max_length']}  epochs={CFG['epochs_task']}  "
         f"lr_enc={CFG['learning_rate']:g}  lr_task_adapter={CFG['task_adapter_lr']:g}  lr_head={CFG['classifier_lr']:g}  "
-        f"wd={CFG['weight_decay']}  val_split={CFG['val_split']}  "
+        f"wd={CFG['weight_decay']}  val={os.path.basename(CFG['source_val_csv'])}  "
         f"seed={CFG['seed']}",
         source_results,
         target_results,

@@ -45,7 +45,8 @@ _DATA = _HERE / '..' / '..' / 'datasets'
 CFG = {
     # Paths
     'dapt_model_dir':     str(_HERE / '..' / '..' / 'dapt_lazada'),
-    'source_labeled_csv': str(_DATA / 'telemedicine_preprocessed' / 'train.csv'),
+    'source_labeled_csv': str(_DATA / 'telemedicine_preprocessed' / 'train_split.csv'),
+    'source_val_csv':     str(_DATA / 'telemedicine_preprocessed' / 'val.csv'),  # shared by all methods
     'source_test_csv':    str(_DATA / 'telemedicine_preprocessed' / 'test.csv'),
     'target_eval_csv':    str(_DATA / 'lazada_test_preprocessed.csv'),
     'output_dir':         str(_HERE / 'models' / 'dapt_lazada_source_finetuned'),  # checkpoints
@@ -60,7 +61,6 @@ CFG = {
     'weight_decay':  0.02,
     'warmup_ratio':  0.1,
     'dropout':       0.2,
-    'val_split':     0.2,    # part of the source training data held out for picking the best epoch
     'logging_steps': 50,
     'seed':          42,
 }
@@ -174,7 +174,7 @@ def print_summary(cfg, source, target):
         f"Model: DAPT-only, no adapter ({Path(cfg['dapt_model_dir']).name})",
         f"batch={cfg['batch_size']}  max_len={cfg['max_length']}  epochs={cfg['epochs']}  "
         f"lr_heads={cfg['head_lr']:g}  wd={cfg['weight_decay']}  "
-        f"val_split={cfg['val_split']}  seed={cfg['seed']}",
+        f"val={Path(cfg['source_val_csv']).name}  seed={cfg['seed']}",
     ]
     for key in ['accuracy', 'precision', 'recall', 'f1']:
         s, t = source[key], target[key]
@@ -245,6 +245,7 @@ def main():
 
     # Data
     train_df = read_labeled_csv(cfg['source_labeled_csv'])
+    val_df = read_labeled_csv(cfg['source_val_csv'])
     source_test_df = read_labeled_csv(cfg['source_test_csv'])
     target_test_df = read_labeled_csv(cfg['target_eval_csv'])
     print('Source training labels:', train_df['label'].value_counts().to_dict())
@@ -256,10 +257,9 @@ def main():
     total = sum(p.numel() for p in model.parameters())
     print(f'Trainable params: {trainable:,} of {total:,}')
 
-    # Tokenize, and hold out part of the source training data for validation
-    split = to_dataset(train_df, tokenizer, cfg['max_length']).train_test_split(
-        test_size=cfg['val_split'], seed=cfg['seed'])
-    train_set, val_set = split['train'], split['test']
+    # Tokenize (the validation set is the fixed val.csv shared by all methods)
+    train_set = to_dataset(train_df, tokenizer, cfg['max_length'])
+    val_set = to_dataset(val_df, tokenizer, cfg['max_length'])
     source_test = to_dataset(source_test_df, tokenizer, cfg['max_length'])
     target_test = to_dataset(target_test_df, tokenizer, cfg['max_length'])
     print(f'Train {len(train_set)} | val {len(val_set)} | '

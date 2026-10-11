@@ -10,7 +10,8 @@
 #   ./run_dapt_source_seeds.sh --head_lr 5e-4 --epochs 5   # any CFG key in the .py is a --flag
 #
 # Logs: outputs/seed_logs/seed_<N>.log
-# All summaries collected in outputs/seed_logs/summary_all.txt
+# Summaries: outputs/seed_logs/summary.txt (every seed) and
+#            outputs/seed_logs/summary_stats.txt (seed 42 + mean ± std)
 
 set -uo pipefail
 
@@ -26,8 +27,6 @@ export MPLBACKEND="${MPLBACKEND:-Agg}"                       # don't block on pl
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
 mkdir -p "$LOG_DIR"
-SUMMARY="$LOG_DIR/summary_all.txt"
-: > "$SUMMARY"
 
 failed=()
 for SEED in $SEEDS; do
@@ -41,12 +40,6 @@ for SEED in $SEEDS; do
     rc=${PIPESTATUS[0]}
     dt=$(( $(date +%s) - t0 ))
 
-    {
-        echo "### seed=${SEED}  (rc=${rc}, ${dt}s)"
-        grep -E '^(Model:|batch=|accuracy:|precision:|recall:|f1:)' "$LOG"
-        echo
-    } >> "$SUMMARY"
-
     if [ "$rc" -ne 0 ]; then
         echo "!! seed=${SEED} FAILED (rc=${rc}) — continuing"
         failed+=("$SEED")
@@ -54,7 +47,8 @@ for SEED in $SEEDS; do
 done
 
 echo
-echo "Done. Summaries: $SUMMARY"
+# summary.txt + summary_stats.txt from the per-seed logs
+"$PYTHON" ../write_seed_summary.py "$LOG_DIR" --seeds "$SEEDS"
 if [ ${#failed[@]} -gt 0 ]; then
     echo "Failed seeds: ${failed[*]}"
     exit 1
